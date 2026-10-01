@@ -252,3 +252,26 @@ test('failed item cleanup retains storage and acknowledged upload success', asyn
   await rm(dir, { recursive: true, force: true });
   job.releaseRetainedReservations(); job.releaseRetainedReservations(); assert.equal(released, 1);
 });
+
+test('a pending refill timer honors the new deadline after the last item settles', async t => {
+  const dir = await folder(t), interval = 60;
+  let release!: () => void, firstPoll!: () => void, settledAt = 0;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const polled = new Promise<void>(resolve => { firstPoll = resolve; });
+  const idlePolls: number[] = [];
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    upload: async () => { await held; },
+    refillIntervalMs: interval,
+    refill: async () => {
+      if (settledAt) idlePolls.push(Date.now());
+      else firstPoll();
+      return { items: [], skipped: [] };
+    }
+  })).start();
+  t.after(() => job.stop());
+  job.on('change', () => { if (!settledAt && job.snapshot().success === 1) settledAt = Date.now(); });
+  await polled; await delay(30); release(); await job.completion;
+  assert.equal(idlePolls.length, 3);
+  assert.ok(idlePolls[0] - settledAt >= interval - 5, 'First confirmation started before the idle deadline');
+  assert.ok(idlePolls[2] - settledAt >= interval * 3 - 10, 'Confirmation window ended too early');
+});

@@ -173,9 +173,13 @@ export class ConversionJob extends EventEmitter {
       if (!this.refill) {
         this.refill = (async () => {
           try {
-            const wait = this.nextRefillAt - Date.now();
-            if (wait > 0) await delay(wait, undefined, { signal: this.controller.signal });
-            await this.gate();
+            // Settling work or resuming can move the deadline while a timer is pending.
+            while (true) {
+              await this.gate();
+              const wait = this.nextRefillAt - Date.now();
+              if (wait <= 0) break;
+              await delay(wait, undefined, { signal: this.controller.signal });
+            }
             const revision = this.settlementRevision;
             const idleAtRequest = this.processing === 0;
             const discovered = await this.dependencies.refill!(this.knownKeys, this.controller.signal);
