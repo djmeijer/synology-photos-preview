@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { once } from 'node:events';
@@ -16,7 +16,7 @@ import type { Hardware } from '../shared/types.ts';
 const hardware: Hardware = { cpu: 'test', logicalCpus: 8, memoryGiB: 32, gpu: null, ffmpeg: true, ffprobe: true, magick: true, heic: true, nvenc: false, cudaScale: false, hdrFilters: true, warnings: [] };
 async function studioFixture(t: test.TestContext) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-app-test-'));
-  const studio = new Studio(directory); studio.hardware = hardware;
+  const studio = new Studio(directory, { refillIntervalMs: 10 }); studio.hardware = hardware;
   t.after(async () => { await studio.shutdown(); await rm(directory, { recursive: true, force: true }); });
   return studio;
 }
@@ -111,4 +111,27 @@ test('settings reject credentials, prototype keys and invalid bounds; subprocess
   const controller = new AbortController();
   const running = command(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { signal: controller.signal });
   setTimeout(() => controller.abort(), 50); await assert.rejects(running, /cancelled/);
+});
+
+test('cleanup and persistence warnings survive finalization without losing successes', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-finalization-test-'));
+  const studio = new Studio(directory, { refillIntervalMs: 5, cleanupRun: async () => { throw new Error('Locked directory'); } });
+  studio.hardware = hardware;
+  t.after(async () => { await studio.shutdown(); await rm(directory, { recursive: true, force: true }); });
+  const nas = await mockNas(t, { queueBatches: [[1], []] });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  // A directory at the history filename makes atomic writes fail on all platforms.
+  await mkdir(path.join(directory, 'history.json'));
+  const original = MediaConverter.prototype.convert;
+  MediaConverter.prototype.convert = async (_item, _source, dir) => {
+    const output = path.join(dir, 'preview.jpg'); await writeFile(output, 'preview'); return { thumb_sm: output };
+  };
+  t.after(() => { MediaConverter.prototype.convert = original; });
+  await studio.start({ library: 'personal' }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(studio.finalizing, false); assert.equal(studio.job!.snapshot().success, 1);
+  assert.equal(studio.job!.status, 'completed_with_errors');
+  assert.ok(studio.job!.snapshot().warnings!.some(message => message.includes('save run history')));
+  assert.ok(studio.job!.snapshot().warnings!.some(message => message.includes('temporary directory')));
+  assert.equal(studio.history[0].status, 'completed_with_errors');
 });

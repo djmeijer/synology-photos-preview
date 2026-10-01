@@ -27,7 +27,7 @@ export class Studio extends EventEmitter {
   private updating = false;
   private shuttingDown = false;
   private persistence = Promise.resolve();
-  constructor(readonly dataDirectory: string) { super(); }
+  constructor(readonly dataDirectory: string, private jobOptions: { refillIntervalMs?: number; cleanupRun?: (directory: string) => Promise<void> } = {}) { super(); }
   async initialize() {
     await mkdir(this.dataDirectory, { recursive: true });
     this.settings = validateSettings(await readJson(path.join(this.dataDirectory, 'settings.json'), defaults));
@@ -36,9 +36,10 @@ export class Studio extends EventEmitter {
       try { await access(portable); this.settings.magick = portable; } catch { /* Use PATH or the configured executable. */ }
     }
     this.history = await readJson(path.join(this.dataDirectory, 'history.json'), []);
+    this.history = this.history.map(run => ({ ...run, skipped: run.skipped ?? 0, warnings: run.warnings ?? [], mediaDateWindowCount: run.mediaDateWindowCount ?? 0, mediaDateKnownCount: run.mediaDateKnownCount ?? 0 }));
     this.history = this.history.map(run => ['running', 'paused', 'stopping'].includes(run.status) ? {
       ...run, status: 'stopped', cancelled: run.cancelled + run.remaining, remaining: 0, active: [], settledPercent: 100,
-      verificationError: 'The application restarted during this batch. Connect and execute again to fetch pending work.'
+      verificationError: 'The application restarted during this run. Connect and execute again to fetch pending work.'
     } : run);
     this.hardware = await inspectHardware(this.settings);
   }
@@ -52,7 +53,10 @@ export class Studio extends EventEmitter {
     this.history = [{ ...snapshot, active: [], errors: snapshot.errors.slice(0, 100) }, ...this.history.filter(run => run.id !== job.id)].slice(0, 10);
     const history = this.history;
     this.persistence = this.persistence.then(() => writeJson(path.join(this.dataDirectory, 'history.json'), history)).catch(() => {
-      job.verificationError = 'Could not save run history.';
+      job.addWarning('Could not save run history.');
+      const latest = job.snapshot();
+      this.history = [{ ...latest, active: [], errors: latest.errors.slice(0, 100) }, ...this.history.filter(run => run.id !== job.id)].slice(0, 10);
+      this.changed();
     });
     return this.persistence;
   }
@@ -128,6 +132,7 @@ export class Studio extends EventEmitter {
       const converter = new MediaConverter(this.settings, this.hardware);
       const job = new ConversionJob(library, items, this.settings, runDirectory, {
         download: nas.download.bind(nas), convert: converter.convert.bind(converter), upload: nas.upload.bind(nas),
+        refillIntervalMs: this.jobOptions.refillIntervalMs,
         refill: async (knownKeys, signal) => this.shuttingDown ? { items: [], skipped: [] } : this.fetchBatch(library, signal, knownKeys)
       }, skipped);
       this.job = job;
@@ -143,10 +148,13 @@ export class Studio extends EventEmitter {
     await firstJob.completion;
     this.finalizing = true; this.changed();
     try {
-      await rm(firstDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-    } catch (error) { firstJob.verificationError = errorMessage(error); }
-    await this.checkpoint(firstJob);
-    this.finalizing = false; this.changed();
+      try {
+        if (this.jobOptions.cleanupRun) await this.jobOptions.cleanupRun(firstDirectory);
+        else await rm(firstDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+        firstJob.releaseRetainedReservations();
+      } catch { firstJob.addWarning('Could not remove the run temporary directory. Its storage reservations remain held.'); }
+      await this.checkpoint(firstJob);
+    } finally { this.finalizing = false; this.changed(); }
   }
   async shutdown() {
     this.shuttingDown = true; this.job?.stop(); await this.batchLoop;

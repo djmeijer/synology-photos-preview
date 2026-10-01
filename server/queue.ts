@@ -40,6 +40,7 @@ export interface JobDependencies {
   reserve?: (item: MediaItem, signal: AbortSignal) => Promise<{ release: () => void; maxBytes: number }>;
   refill?: (knownKeys: ReadonlySet<string>, signal: AbortSignal) => Promise<ConversionBatch>;
   refillIntervalMs?: number;
+  cleanup?: (directory: string) => Promise<void>;
 }
 function workPriority(a: MediaItem, b: MediaItem) {
   const video = Number(b.needVideo) - Number(a.needVideo);
@@ -53,7 +54,7 @@ export class DiskBudget {
   constructor(private settings: Settings, private directory: string) {}
   async acquire(item: MediaItem, signal: AbortSignal) {
     const budget = this.settings.maxStagedGiB * 1024 ** 3;
-    const needed = item.size ? item.size * 2 + 128 * 1024 ** 2 : budget / this.settings.downloads;
+    const needed = item.size ? item.size * 2 + 128 * 1024 ** 2 : Math.max(128 * 1024 ** 2, budget / this.settings.downloads);
     if (needed > budget) throw new AppError('File exceeds the staged-storage budget. Increase max staged storage.', 409);
     let waits = 0;
     while (true) {
@@ -63,7 +64,8 @@ export class DiskBudget {
       if (free < this.settings.diskReserveGiB * 1024 ** 3 + needed && this.reserved === 0) throw new AppError('Insufficient free temporary storage. Free disk space or select another temporary directory.', 409);
       if (this.reserved + needed <= budget && free - this.reserved - needed >= this.settings.diskReserveGiB * 1024 ** 3 && os.freemem() > 1024 ** 3) {
         this.reserved += needed;
-        return { maxBytes: Math.floor((needed - 64 * 1024 ** 2) / 2), release: () => { this.reserved -= needed; } };
+        let released = false;
+        return { maxBytes: Math.floor((needed - 64 * 1024 ** 2) / 2), release: () => { if (!released) { released = true; this.reserved -= needed; } } };
       }
       if (++waits >= 120) throw new AppError('Resource pressure did not clear after two minutes. Reduce workers or increase temporary storage.', 409);
       await delay(1000, undefined, { signal });
@@ -87,6 +89,9 @@ export class ConversionJob extends EventEmitter {
   private next = 0;
   private refill: Promise<void> | null = null;
   private nextRefillAt = 0;
+  private idleChecks = 0;
+  private settlementRevision = 0;
+  private retainedReservations: (() => void)[] = [];
   private knownKeys = new Set<string>();
   private lastNotification = 0;
   private downloadedBytes = 0;
@@ -109,8 +114,8 @@ export class ConversionJob extends EventEmitter {
   }
   get active() { return !this.finished; }
   start() { if (this.started) throw new AppError('Job has already started.', 409); this.started = true; this.completion = this.run(); return this; }
-  pause() { if (this.status !== 'running') throw new AppError('Only a running job can be paused.', 409); this.status = 'paused'; this.notify(true); }
-  resume() { if (this.status !== 'paused') throw new AppError('Job is not paused.', 409); this.status = 'running'; this.wake(); this.notify(true); }
+  pause() { if (this.status !== 'running') throw new AppError('Only a running job can be paused.', 409); this.status = 'paused'; this.resetIdleConfirmation(); this.notify(true); }
+  resume() { if (this.status !== 'paused') throw new AppError('Job is not paused.', 409); this.status = 'running'; this.resetIdleConfirmation(); this.wake(); this.notify(true); }
   stop() { if (!this.active) return; this.status = 'stopping'; this.controller.abort(); this.wake(); this.wakeWork(); this.notify(true); }
   private wake() { this.resumeWaiters.splice(0).forEach(resolve => resolve()); }
   private wakeWork() { this.workWaiters.splice(0).forEach(resolve => resolve()); }
@@ -144,6 +149,12 @@ export class ConversionJob extends EventEmitter {
       this.addWarning(`Skipped ${item.filename} (${item.space}, unit ${item.unitId}): ${item.reason}`);
     }
   }
+  private get refillIntervalMs() { return this.dependencies.refillIntervalMs ?? 2000; }
+  private resetIdleConfirmation() {
+    this.idleChecks = 0; this.settlementRevision++;
+    if (this.processing === 0) this.nextRefillAt = Date.now() + this.refillIntervalMs;
+  }
+  releaseRetainedReservations() { this.retainedReservations.splice(0).forEach(release => release()); }
   private async gate() {
     while (this.status === 'paused') await new Promise<void>(resolve => this.resumeWaiters.push(resolve));
     this.controller.signal.throwIfAborted();
@@ -164,7 +175,11 @@ export class ConversionJob extends EventEmitter {
           try {
             const wait = this.nextRefillAt - Date.now();
             if (wait > 0) await delay(wait, undefined, { signal: this.controller.signal });
+            await this.gate();
+            const revision = this.settlementRevision;
+            const idleAtRequest = this.processing === 0;
             const discovered = await this.dependencies.refill!(this.knownKeys, this.controller.signal);
+            this.controller.signal.throwIfAborted();
             this.addSkipped(discovered.skipped);
             let added = 0;
             const addedItems: ItemProgress[] = [];
@@ -176,7 +191,12 @@ export class ConversionJob extends EventEmitter {
             }
             if (addedItems.length) this.setMediaDates(addedItems);
             this.items.push(...addedItems.sort(workPriority));
-            this.nextRefillAt = added ? 0 : Date.now() + (this.dependencies.refillIntervalMs ?? 2000);
+            if (added) this.resetIdleConfirmation();
+            this.nextRefillAt = added ? 0 : Date.now() + this.refillIntervalMs;
+            // Only fresh requests made after all work settled can confirm exhaustion.
+            if (!added && idleAtRequest && this.processing === 0 && revision === this.settlementRevision && this.status === 'running') {
+              if (++this.idleChecks >= 3) this.sourceDone = true;
+            }
           } catch (error) {
             if (!this.controller.signal.aborted) this.verificationError = errorMessage(error);
             this.sourceDone = true;
@@ -188,9 +208,6 @@ export class ConversionJob extends EventEmitter {
       await this.refill;
       if (this.next < this.items.length) continue;
       if (this.sourceDone) return null;
-      if (this.processing === 0) {
-        this.sourceDone = true; this.wakeWork(); return null;
-      }
       // NAS can briefly repeat the same capped page after uploads. Keep one
       // throttled refill alive so idle workers can discover the next page
       // while a slow conversion is still running.
@@ -213,10 +230,12 @@ export class ConversionJob extends EventEmitter {
             await this.gate();
             const reservation = await (this.dependencies.reserve?.(item, signal) ?? disk.acquire(item, signal));
             release = reservation.release; maxBytes = reservation.maxBytes;
+            await this.gate();
             itemDirectory = await mkdtemp(path.join(this.directory, 'item-'));
             // NAS filenames are labels only; never use them as filesystem paths.
             const extension = path.extname(item.filename).match(/^\.[a-zA-Z0-9]{1,8}$/)?.[0] ?? '.bin';
             source = path.join(itemDirectory, `source${extension}`);
+            await this.gate();
             item.stage = 'download'; item.percent = 0; this.notify(true);
             let previousBytes = 0;
             await this.dependencies.download(item, source, signal, maxBytes, (percent, bytes = 0) => {
@@ -248,11 +267,15 @@ export class ConversionJob extends EventEmitter {
           if (this.controller.signal.aborted) { item.stage = 'cancelled'; item.percent = null; }
           else { item.stage = 'failed'; item.error = errorMessage(error); item.percent = null; }
         } finally {
+          let cleaned = true;
           if (itemDirectory) {
-            try { await rm(itemDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 }); }
-            catch { item.error = `${item.error ?? ''} Temporary-file cleanup failed.`.trim(); }
+            try {
+              if (this.dependencies.cleanup) await this.dependencies.cleanup(itemDirectory);
+              else await rm(itemDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+            } catch { cleaned = false; this.addWarning(`Temporary-file cleanup failed for ${item.filename}. Storage remains reserved until run cleanup succeeds.`); }
           }
-          release?.(); this.processing--; this.wakeWork(); this.notify(true);
+          if (cleaned) release?.(); else if (release) this.retainedReservations.push(release);
+          this.processing--; this.resetIdleConfirmation(); this.wakeWork(); this.notify(true);
         }
       }
     };

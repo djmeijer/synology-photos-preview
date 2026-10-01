@@ -4,7 +4,7 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { ConversionJob, type JobDependencies, Semaphore } from '../server/queue.ts';
+import { ConversionJob, DiskBudget, type JobDependencies, Semaphore } from '../server/queue.ts';
 import { defaults } from '../server/settings.ts';
 import { AppError } from '../server/errors.ts';
 import type { MediaItem } from '../shared/types.ts';
@@ -111,6 +111,7 @@ test('date window carries across overlapping refills and counts missing dates', 
     takenAt: new Date(Date.UTC(2020, 0, index + 1)).toISOString() }));
   let calls = 0;
   const job = new ConversionJob('both', input.slice(0, 110), defaults, dir, dependencies({
+    refillIntervalMs: 5,
     refill: async () => ({ items: ++calls === 1 ? [input[0], ...input.slice(110)] : [], skipped: [] })
   })).start();
   await job.completion;
@@ -129,6 +130,7 @@ test('skipped components warn without entering the pipeline and retry resets tra
   const dir = await folder(t), item = items(1)[0];
   const skipped = { key: 'personal:2:live_video', space: 'personal' as const, unitId: 2, filename: 'live.mov', reason: 'Unverified Live Photo component' };
   const job = new ConversionJob('personal', [item], defaults, dir, dependencies({
+    refillIntervalMs: 5,
     refill: async () => ({ items: [], skipped: [skipped, skipped] })
   }), [skipped]).start();
   await job.completion;
@@ -139,4 +141,114 @@ test('skipped components warn without entering the pipeline and retry resets tra
   const retry = new ConversionJob('personal', [retryInput], defaults, dir, dependencies());
   assert.equal(retry.items[0].error, undefined); assert.equal(retry.items[0].backend, undefined);
   assert.equal(retry.items[0].percent, null); assert.equal(retry.snapshot().mediaDateWindowCount, 1);
+});
+
+test('a stale refill after the final upload cannot hide newly exposed work', async t => {
+  const dir = await folder(t), base = dependencies();
+  let uploaded!: () => void, calls = 0;
+  const done = new Promise<void>(resolve => { uploaded = resolve; });
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    upload: async (...args) => { await base.upload(...args); uploaded(); },
+    refillIntervalMs: 10,
+    refill: async () => {
+      if (++calls === 1) { await done; await delay(10); return { items: items(1), skipped: [] }; }
+      return { items: calls === 2 ? items(2).slice(1) : [], skipped: [] };
+    }
+  })).start();
+  await job.completion;
+  assert.equal(job.snapshot().success, 2); assert.equal(job.status, 'completed');
+  assert.ok(calls >= 5);
+});
+
+test('new work on the third idle check resets all three confirmations', async t => {
+  const dir = await folder(t); let idleChecks = 0, added = false, allSettled = false;
+  const timestamps: number[] = [];
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    refillIntervalMs: 15,
+    refill: async () => {
+      if (allSettled) {
+        idleChecks++; timestamps.push(Date.now());
+        if (!added && idleChecks === 3) { added = true; return { items: items(2).slice(1), skipped: [] }; }
+      }
+      return { items: [], skipped: [] };
+    }
+  })).start();
+  job.on('change', () => { allSettled = job.snapshot().remaining === 0; });
+  await job.completion;
+  assert.equal(job.snapshot().success, 2); assert.equal(idleChecks, 6);
+  assert.ok(timestamps[1] - timestamps[0] >= 10 && timestamps[2] - timestamps[1] >= 10);
+});
+
+test('pause suspends idle confirmation, resume restarts it, and stop cancels a pending check', async t => {
+  const dir = await folder(t); let idle = 0, entered!: () => void, release!: () => void;
+  const entering = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    refillIntervalMs: 10,
+    refill: async () => {
+      if (job.snapshot().remaining === 0 && ++idle === 1) { entered(); await held; }
+      return { items: [], skipped: [] };
+    }
+  })).start();
+  t.after(() => job.stop());
+  await entering; job.pause(); release(); await delay(40);
+  assert.equal(idle, 1); assert.equal(job.status, 'paused');
+  job.resume(); await job.completion;
+  assert.equal(idle, 4); assert.equal(job.status, 'completed');
+  const stopped = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    refillIntervalMs: 10_000, refill: async () => ({ items: [], skipped: [] })
+  })).start();
+  while (stopped.snapshot().remaining) await delay(1);
+  stopped.stop(); await stopped.completion;
+  assert.equal(stopped.status, 'stopped');
+});
+
+test('refill failure drains admitted work and prevents a clean completion status', async t => {
+  const dir = await folder(t);
+  const job = new ConversionJob('personal', items(3), defaults, dir, dependencies({
+    refill: async () => { throw new AppError('Queue listing unavailable'); }
+  })).start();
+  await job.completion;
+  assert.equal(job.snapshot().success, 3); assert.equal(job.status, 'completed_with_errors');
+  assert.equal(job.snapshot().verificationError, 'Queue listing unavailable');
+});
+
+test('small staged budgets give unknown-size downloads a positive allowance', async t => {
+  const dir = await folder(t);
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 16, diskReserveGiB: 1 }, dir);
+  const reservation = await budget.acquire(items(1)[0], new AbortController().signal);
+  assert.equal(reservation.maxBytes, 32 * 1024 ** 2);
+  reservation.release(); reservation.release();
+});
+
+test('pause during reservation blocks downloads and stop releases that reservation', async t => {
+  const dir = await folder(t);
+  for (const stop of [false, true]) {
+    let entered!: () => void, release!: () => void, released = 0, downloads = 0;
+    const entering = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const base = dependencies();
+    const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+      reserve: async () => { entered(); await held; return { maxBytes: 1024, release: () => { released++; } }; },
+      download: async (...args) => { downloads++; await base.download(...args); }
+    })).start();
+    await entering; job.pause(); release(); await delay(25);
+    assert.equal(downloads, 0); assert.equal(released, 0);
+    if (stop) job.stop(); else job.resume();
+    await job.completion;
+    assert.equal(downloads, stop ? 0 : 1); assert.equal(released, 1);
+  }
+});
+
+test('failed item cleanup retains storage and acknowledged upload success', async t => {
+  const dir = await folder(t); let released = 0;
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    reserve: async () => ({ maxBytes: 1024, release: () => { released++; } }),
+    cleanup: async () => { throw new Error('Locked file'); }
+  })).start();
+  await job.completion;
+  assert.equal(released, 0); assert.equal(job.snapshot().success, 1); assert.equal(job.snapshot().failed, 0);
+  assert.equal(job.status, 'completed_with_errors'); assert.match(job.snapshot().warnings![0], /file-0.jpg/);
+  await rm(dir, { recursive: true, force: true });
+  job.releaseRetainedReservations(); job.releaseRetainedReservations(); assert.equal(released, 1);
 });
