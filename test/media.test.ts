@@ -17,6 +17,7 @@ test('rotated, odd, portrait and small video dimensions preserve the aspect rati
   assert.deepEqual(videoDimensions({ ...info, width: 639, height: 359 }), { width: 638, height: 358 });
   const hdr = videoArgs('in.mp4', 'out.mp4', { ...info, hdr: true }, defaults, 'nvenc');
   assert.ok(hdr.includes('0:a:0?')); assert.ok(hdr.includes('p1')); assert.ok(hdr.includes('23')); assert.ok(hdr.some(x => x.includes('tonemap=')));
+  assert.equal(hdr[hdr.indexOf('-fpsmax') + 1], '30');
   const hdrFilter = softwareFilters({ ...info, hdr: true }, 720, 1280);
   assert.match(hdrFilter, /^zscale=w=720:h=1280:t=linear/);
   assert.doesNotMatch(hdrFilter, /(?:^|,)scale=720:1280/);

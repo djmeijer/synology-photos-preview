@@ -12,6 +12,7 @@ The application is useful when preview generation on the NAS is slow, incomplete
 - Works with Personal Space, Shared Space, or both when the NAS advertises the required APIs.
 - Generates three image thumbnails with ImageMagick.
 - Extracts video thumbnails and, when requested by the NAS, generates a 720p H.264/AAC preview with FFmpeg.
+- Caps generated video previews at 30 fps, avoiding unnecessary work for 60–240 fps camera footage.
 - Uses NVIDIA decoding, scaling, and NVENC encoding when the media and installed FFmpeg build support it.
 - Tone maps HDR10 and HLG video to BT.709 for compatible previews.
 - Keeps download, image, video, and upload concurrency independent.

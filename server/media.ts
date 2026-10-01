@@ -42,6 +42,10 @@ export function videoArgs(source: string, destination: string, info: VideoInfo, 
     '-i', source, '-map', `0:${info.streamIndex}`, '-map', '0:a:0?', '-vf', filter,
     ...(mode === 'software' ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(settings.cq)]
       : ['-c:v', 'h264_nvenc', '-preset', 'p1', '-tune', 'hq', '-rc', 'vbr', '-cq', String(settings.cq), '-b:v', '0', '-multipass', 'disabled']),
+    // Synology previews do not benefit from high-speed source frame rates. This
+    // leaves 24/25/30 fps media untouched and avoids encoding up to 8x as many
+    // frames for 60-240 fps camera footage.
+    '-fpsmax', '30',
     '-threads', String(settings.softwareThreads), '-filter_threads', String(settings.softwareThreads),
     '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', '-map_metadata', '-1', '-metadata:s:v:0', 'rotate=0',
     ...(info.hdr ? ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709'] : []),
