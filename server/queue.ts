@@ -146,7 +146,7 @@ export class ConversionJob extends EventEmitter {
     for (const item of items) {
       if (this.skippedKeys.has(item.key)) continue;
       this.skippedKeys.add(item.key);
-      this.addWarning(`Skipped ${item.filename} (${item.space}, unit ${item.unitId}): ${item.reason}`);
+      this.warnings.add(`Skipped ${item.filename} (${item.space}, unit ${item.unitId}): ${item.reason}`);
     }
   }
   private get refillIntervalMs() { return this.dependencies.refillIntervalMs ?? 2000; }

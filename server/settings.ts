@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AppError } from './errors.ts';
@@ -23,7 +23,7 @@ export function validateSettings(input: unknown, current = defaults): Settings {
     if (bounds) {
       if (typeof value !== 'number' || !Number.isInteger(value) || value < bounds[0] || value > bounds[1]) throw new AppError(`Invalid ${key}; expected ${bounds[0]}–${bounds[1]}.`);
     } else if (key === 'library') {
-      if (!['personal', 'shared', 'both'].includes(String(value))) throw new AppError('Invalid library.');
+      if (typeof value !== 'string' || !['personal', 'shared', 'both'].includes(value)) throw new AppError('Invalid library.');
     } else if (typeof value !== 'string' || value.length > 2048 || /[\r\n\0]/.test(value)) throw new AppError(`Invalid ${key}.`);
     Object.assign(result, { [key]: value });
   }
@@ -36,6 +36,8 @@ export async function readJson<T>(filename: string, fallback: T): Promise<T> {
 export async function writeJson(filename: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filename), { recursive: true });
   const temporary = `${filename}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(value, null, 2), { mode: 0o600 });
-  await rename(temporary, filename);
+  try {
+    await writeFile(temporary, JSON.stringify(value, null, 2), { mode: 0o600 });
+    await rename(temporary, filename);
+  } finally { await rm(temporary, { force: true }).catch(() => {}); }
 }

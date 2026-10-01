@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import path from 'node:path';
 import os from 'node:os';
 import { once } from 'node:events';
-import { Studio, createApp } from '../server/app.ts';
+import { Studio, createApp, validateJobInput } from '../server/app.ts';
 import { mockNas } from './mock-nas.ts';
 import { MediaConverter } from '../server/media.ts';
 import { command } from '../server/process.ts';
@@ -31,6 +31,10 @@ test('local API requires loopback Host and a same-origin CSRF token; SSE supplie
   assert.equal((await fetch(`${base}/api/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
   assert.equal((await fetch(`${base}/api/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Preview-Token': state.csrfToken, Origin: 'https://foreign.example' }, body: '{}' })).status, 403);
   assert.equal((await fetch(`${base}/api/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Preview-Token': state.csrfToken }, body: '{}' })).status, 200);
+  for (const body of ['{invalid', '[]', 'null', '{"retryFailed":"true"}', '{"library":["personal"]}']) {
+    const invalid = await fetch(`${base}/api/jobs`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Preview-Token': state.csrfToken }, body });
+    assert.equal(invalid.status, 400); assert.equal((await invalid.json() as any).code, 'APP_ERROR');
+  }
   const hostile = await new Promise<number>(resolve => { http.get(`${base}/api/state`, { headers: { Host: 'foreign.example' } }, res => { res.resume(); resolve(res.statusCode!); }); });
   assert.equal(hostile, 403);
   for (let i = 0; i < 2; i++) {
@@ -108,9 +112,41 @@ test('settings reject credentials, prototype keys and invalid bounds; subprocess
   assert.throws(() => validateSettings({ password: 'secret' }), /Unknown setting/);
   assert.throws(() => validateSettings(JSON.parse('{"__proto__":{}}')), /Unknown setting/);
   assert.throws(() => validateSettings({ videos: 9 }), /Invalid/);
+  assert.throws(() => validateSettings({ library: ['personal'] }), /Invalid library/);
   const controller = new AbortController();
   const running = command(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { signal: controller.signal });
   setTimeout(() => controller.abort(), 50); await assert.rejects(running, /cancelled/);
+});
+
+test('job request validation accepts only an object with typed options', () => {
+  for (const input of [null, undefined, false, 1, 'personal', [], { library: ['personal'] }, { library: null }, { retryFailed: 'true' }, { retryFailed: null }, { extra: true }]) {
+    assert.throws(() => validateJobInput(input), AppError);
+  }
+  assert.deepEqual(validateJobInput({}), {});
+  assert.deepEqual(validateJobInput({ library: 'personal', retryFailed: false }), { library: 'personal', retryFailed: false });
+});
+
+test('disconnect guards overlapping connection operations until logout completes', async t => {
+  const studio = await studioFixture(t), nas = await mockNas(t);
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  const client = studio.nas!, original = client.logout.bind(client);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  client.logout = async () => { await held; await original(); };
+  const disconnecting = studio.disconnect();
+  await assert.rejects(studio.connect({ url: nas.url, username: 'test-user', password: 'secret' }), /current operation/);
+  await assert.rejects(studio.disconnect(), /current operation/);
+  await assert.rejects(studio.start({ library: 'personal' }), /current operation/);
+  release(); await disconnecting; assert.equal(studio.nas, null);
+});
+
+test('a normal run persists its selected space for the next session', async t => {
+  const studio = await studioFixture(t), nas = await mockNas(t);
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  await studio.start({ library: 'personal' }); studio.job!.stop(); await studio.job!.completion;
+  assert.equal(studio.settings.library, 'personal');
+  const persisted = JSON.parse(await readFile(path.join(studio.dataDirectory, 'settings.json'), 'utf8'));
+  assert.equal(persisted.library, 'personal');
 });
 
 test('cleanup and persistence warnings survive finalization without losing successes', async t => {
@@ -134,4 +170,31 @@ test('cleanup and persistence warnings survive finalization without losing succe
   assert.ok(studio.job!.snapshot().warnings!.some(message => message.includes('save run history')));
   assert.ok(studio.job!.snapshot().warnings!.some(message => message.includes('temporary directory')));
   assert.equal(studio.history[0].status, 'completed_with_errors');
+});
+
+test('mixed Live Photo batches process supported files and unsupported-only batches do not launch', async t => {
+  const supported = { unit_id: 1, filename: 'regular.jpg', type: 'photo', need_thumbnail: true, time: 1_609_459_200 };
+  const unsupported = { unit_id: 2, filename: 'live.mov', type: 'live_video', need_video: true };
+  for (const mixed of [false, true]) {
+    await t.test(mixed ? 'mixed batch' : 'unsupported only', async t => {
+      const studio = await studioFixture(t), nas = await mockNas(t, { queueList: mixed ? [supported, unsupported] : [unsupported] });
+      await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+      if (!mixed) {
+        await assert.rejects(studio.start({ library: 'personal' }), /No supported pending previews/);
+        assert.equal(studio.job, null); assert.equal(studio.starting, false);
+      } else {
+        const original = MediaConverter.prototype.convert;
+        MediaConverter.prototype.convert = async (_item, _source, dir) => {
+          const output = path.join(dir, 'preview.jpg'); await writeFile(output, 'preview'); return { thumb_sm: output };
+        };
+        t.after(() => { MediaConverter.prototype.convert = original; });
+        await studio.start({ library: 'personal' }); await studio.job!.completion;
+        assert.equal(studio.job!.snapshot().success, 1); assert.equal(studio.job!.snapshot().skipped, 1);
+        assert.equal(studio.job!.status, 'completed_with_errors');
+      }
+      const transfers = nas.requests.filter(request => ['download', 'upload'].includes(request.method));
+      assert.equal(transfers.length, mixed ? 2 : 0);
+      assert.ok(transfers.every(request => request.params.get('unit_id') !== '[2]' && !request.body.includes('name="unit_id"\r\n\r\n2\r\n')));
+    });
+  }
 });

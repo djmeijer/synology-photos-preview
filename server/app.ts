@@ -12,6 +12,14 @@ import { ConversionJob } from './queue.ts';
 import type { AppState, ConversionBatch, Hardware, JobSnapshot, Library, MediaItem, Settings, SkippedMedia, Space } from '../shared/types.ts';
 
 export const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export function validateJobInput(input: unknown): { library?: Library; retryFailed?: boolean } {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new AppError('Job request must be an object.');
+  const values = input as Record<string, unknown>;
+  if (Object.keys(values).some(key => !['library', 'retryFailed'].includes(key))) throw new AppError('Unknown job request option.');
+  if (Object.hasOwn(values, 'library') && (typeof values.library !== 'string' || !['personal', 'shared', 'both'].includes(values.library))) throw new AppError('Invalid library.');
+  if (Object.hasOwn(values, 'retryFailed') && typeof values.retryFailed !== 'boolean') throw new AppError('retryFailed must be a boolean.');
+  return values as { library?: Library; retryFailed?: boolean };
+}
 export class Studio extends EventEmitter {
   readonly serverId = randomUUID();
   private revision = 0;
@@ -61,6 +69,7 @@ export class Studio extends EventEmitter {
     return this.persistence;
   }
   private ensureIdle() {
+    if (this.shuttingDown) throw new AppError('The desktop server is shutting down.', 409);
     if (this.job?.active || this.connecting || this.starting || this.updating || this.finalizing) throw new AppError('Finish or stop the current operation first.', 409);
   }
   async saveSettings(input: unknown) {
@@ -84,7 +93,11 @@ export class Studio extends EventEmitter {
       await writeJson(path.join(this.dataDirectory, 'settings.json'), this.settings);
     } finally { this.connecting = false; this.changed(); }
   }
-  async disconnect() { this.ensureIdle(); await this.nas?.logout(); this.nas = null; this.changed(); }
+  async disconnect() {
+    this.ensureIdle(); this.connecting = true;
+    try { await this.nas?.logout(); this.nas = null; }
+    finally { this.connecting = false; this.changed(); }
+  }
   private validateLibrary(library: Library): Space[] {
     const nas = this.nas;
     if (!nas?.connection.connected) throw new AppError('Connect to your NAS first.', 401);
@@ -101,19 +114,24 @@ export class Studio extends EventEmitter {
     }
     return batch;
   }
-  async start(input: { library?: Library; retryFailed?: boolean }) {
+  async start(input: unknown) {
+    const options = validateJobInput(input);
     this.ensureIdle(); this.starting = true; this.changed();
     try {
       if (!this.nas?.connection.connected) throw new AppError('Connect to your NAS first.', 401);
       let items: MediaItem[], library: Library;
       let skipped: SkippedMedia[] = [];
-      if (input.retryFailed) {
+      if (options.retryFailed) {
         if (!this.job || !this.job.failedItems().length) throw new AppError('No failed files to retry.', 409);
         library = this.job.library;
         this.validateLibrary(library);
         items = this.job.failedItems();
       } else {
-        library = input.library ?? this.settings.library;
+        library = options.library ?? this.settings.library;
+        this.validateLibrary(library);
+        const settings = { ...this.settings, library };
+        await writeJson(path.join(this.dataDirectory, 'settings.json'), settings);
+        this.settings = settings;
         ({ items, skipped } = await this.fetchBatch(library));
       }
       if (!items.length) throw new AppError(skipped.length ? `No supported pending previews. ${skipped.length} unsupported Live Photo video component(s) remain on the NAS.` : 'The NAS returned no pending previews for the selected space.', 409);
@@ -210,6 +228,8 @@ export function createApp(studio: Studio, port = 4177) {
   app.get('/', (_req, res) => res.sendFile(path.join(projectDirectory, 'dist', 'index.html')));
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     if (res.headersSent) return;
+    if ((error as { type?: string })?.type === 'entity.parse.failed') return void res.status(400).json({ error: 'Request body must be valid JSON.', code: 'APP_ERROR' });
+    if ((error as { type?: string })?.type === 'entity.too.large') return void res.status(413).json({ error: 'Request body is too large.', code: 'APP_ERROR' });
     res.status(error instanceof AppError ? error.status : 500).json({ error: errorMessage(error),
       code: error instanceof AppError ? error.code : 'INTERNAL_ERROR', otpRequired: error instanceof NasError && error.nasCode === 403 });
   });

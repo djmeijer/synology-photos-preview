@@ -128,3 +128,26 @@ test('known work is excluded before date lookup and optional lookup honors cance
     controller.abort(); throw controller.signal.reason;
   }, 'personal', controller.signal), { name: 'AbortError' });
 });
+
+test('the fallback device token is validated before constructing cookies', async t => {
+  for (const deviceToken of ['bad; id=other', 'bad\r\nheader', 42, {}]) {
+    const { client } = await mockNas(t, { deviceToken });
+    await assert.rejects(client.login('secret'), /invalid session tokens/);
+    assert.equal(client.connection.connected, false);
+  }
+});
+
+test('transfer retries reset byte progress even when the next attempt is larger', async t => {
+  const { client, requests } = await mockNas(t, { partialDownload: true, transientUpload: true });
+  await client.login('secret');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-retry-bytes-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const item = normalizeItem(raw(1), 'personal'), source = path.join(directory, 'source.jpg');
+  const downloadBytes: number[] = [], uploadBytes: number[] = [];
+  await client.download(item, source, new AbortController().signal, 1024, (_percent, bytes = 0) => downloadBytes.push(bytes));
+  assert.deepEqual(downloadBytes, [0, 5, 0, 14]);
+  await client.upload(item, { thumb_sm: source }, new AbortController().signal, (_percent, bytes = 0) => uploadBytes.push(bytes));
+  assert.equal(uploadBytes.filter(bytes => bytes === 0).length, 2);
+  assert.equal(requests.filter(request => request.method === 'upload').length, 2);
+  await client.logout();
+});

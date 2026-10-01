@@ -20,6 +20,19 @@ test('rotated, odd, portrait and small video dimensions preserve the aspect rati
   assert.match(hdrFilter, /^zscale=w=720:h=1280:t=linear/);
   assert.doesNotMatch(hdrFilter, /(?:^|,)scale=720:1280/);
 });
+
+test('encoding maps the probed movie stream instead of preceding cover art', () => {
+  const info = parseVideoInfo({ streams: [
+    { index: 0, codec_type: 'video', width: 300, height: 300, disposition: { attached_pic: 1 } },
+    { index: 2, codec_type: 'video', width: 1920, height: 1080 }
+  ], format: { duration: '5' } });
+  assert.equal(info.streamIndex, 2);
+  for (const mode of ['cuda', 'nvenc', 'software'] as const) {
+    const args = videoArgs('in.mp4', 'out.mp4', info, defaults, mode);
+    assert.equal(args[args.indexOf('-map') + 1], '0:2');
+  }
+  assert.throws(() => parseVideoInfo({ streams: [{ codec_type: 'video', index: -1, width: 2, height: 2 }] }), /stream index/);
+});
 test('real FFmpeg/ImageMagick conversions: HEIC, rotated, HEVC 10-bit, HDR, silent and corrupt media', { skip: process.env.MEDIA_TESTS !== '1', timeout: 180_000 }, async t => {
   const settings = await localSettings(), hardware = await inspectHardware(settings);
   assert.equal(hardware.magick, true); assert.equal(hardware.heic, true);
