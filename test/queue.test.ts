@@ -42,6 +42,66 @@ test('disk reservations account for image caches without consuming the media all
   const minimum = await manyDownloads.acquire({ ...photo, size: undefined }, signal);
   assert.equal(minimum.maxBytes, 32 * 1024 ** 2); minimum.release();
 });
+test('storage backpressure waits beyond two minutes and resumes when an admitted file releases its reservation', async t => {
+  const dir = await folder(t), signal = new AbortController().signal;
+  t.mock.method(os, 'freemem', () => 8 * 1024 ** 3);
+  const movie = { ...items(2)[1], needThumbnail: false };
+  let polls = 0, release!: () => void;
+  // Each callback replaces a one-second wait without slowing down the test.
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 1, diskReserveGiB: 1 }, dir, async () => {
+    if (++polls === 130) release();
+  });
+  const admitted = await budget.acquire(movie, signal); release = admitted.release;
+  const next = await budget.acquire(movie, signal);
+  assert.equal(polls, 130);
+  assert.equal(next.maxBytes, admitted.maxBytes);
+  next.release();
+});
+
+test('Stop can abort a storage waiter after more than two minutes without consuming a reservation', async t => {
+  const dir = await folder(t), controller = new AbortController();
+  t.mock.method(os, 'freemem', () => 8 * 1024 ** 3);
+  const movie = { ...items(2)[1], needThumbnail: false };
+  let polls = 0;
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 1, diskReserveGiB: 1 }, dir, async () => {
+    if (++polls === 130) controller.abort();
+  });
+  const admitted = await budget.acquire(movie, new AbortController().signal);
+  await assert.rejects(budget.acquire(movie, controller.signal), { name: 'AbortError' });
+  assert.equal(polls, 130);
+  admitted.release();
+  const next = await budget.acquire(movie, new AbortController().signal);
+  next.release();
+});
+
+test('cleanup failures cannot strand the reservation queue indefinitely', async t => {
+  const dir = await folder(t), signal = new AbortController().signal;
+  t.mock.method(os, 'freemem', () => 8 * 1024 ** 3);
+  const movie = { ...items(2)[1], needThumbnail: false };
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 1, diskReserveGiB: 1 }, dir);
+  const admitted = await budget.acquire(movie, signal);
+  admitted.retain(); admitted.retain();
+  await assert.rejects(budget.acquire(movie, signal), /storage remains reserved after cleanup failures/);
+  admitted.release(); admitted.release(); admitted.retain();
+  const next = await budget.acquire(movie, signal);
+  next.release();
+});
+
+test('persistent low memory without admitted work has a bounded, memory-specific failure', async t => {
+  const dir = await folder(t), signal = new AbortController().signal;
+  t.mock.method(os, 'freemem', () => 1024 ** 3);
+  let polls = 0;
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 1, diskReserveGiB: 1 }, dir, async () => { polls++; });
+  await assert.rejects(budget.acquire({ ...items(2)[1], needThumbnail: false }, signal), /Available memory stayed at or below 1 GiB for two minutes/);
+  assert.equal(polls, 119);
+});
+
+test('insufficient temporary disk space without admitted work fails immediately', async t => {
+  const dir = await folder(t), signal = new AbortController().signal;
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 1, diskReserveGiB: Number.MAX_SAFE_INTEGER }, dir);
+  await assert.rejects(budget.acquire({ ...items(2)[1], needThumbnail: false }, signal), /Insufficient free temporary storage/);
+});
+
 test('independent stage limits, duplicate prevention, cleanup, transfer progress and success acknowledgments', async t => {
   const dir = await folder(t), settings = { ...defaults, downloads: 2, images: 3, videos: 2, uploads: 1 };
   const active = { download: 0, image: 0, video: 0, upload: 0 }, peak = { ...active };
@@ -281,13 +341,13 @@ test('pause during reservation blocks downloads and stop releases that reservati
 });
 
 test('failed item cleanup retains storage and acknowledged upload success', async t => {
-  const dir = await folder(t); let released = 0;
+  const dir = await folder(t); let released = 0, retained = 0;
   const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
-    reserve: async () => ({ maxBytes: 1024, release: () => { released++; } }),
+    reserve: async () => ({ maxBytes: 1024, release: () => { released++; }, retain: () => { retained++; } }),
     cleanup: async () => { throw new Error('Locked file'); }
   })).start();
   await job.completion;
-  assert.equal(released, 0); assert.equal(job.snapshot().success, 1); assert.equal(job.snapshot().failed, 0);
+  assert.equal(released, 0); assert.equal(retained, 1); assert.equal(job.snapshot().success, 1); assert.equal(job.snapshot().failed, 0);
   assert.equal(job.status, 'completed_with_errors'); assert.match(job.snapshot().warnings![0], /file-0.jpg/);
   await rm(dir, { recursive: true, force: true });
   job.releaseRetainedReservations(); job.releaseRetainedReservations(); assert.equal(released, 1);

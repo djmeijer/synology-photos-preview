@@ -169,7 +169,9 @@ Temporary files use `.data/work` unless **Temporary directory** is configured. E
 
 When Synology supplies a source size, the application reserves twice that size plus 128 MiB, with an additional 1 GiB for the ImageMagick disk cache when thumbnails are needed. If the size is absent, its reservation is the staged-storage budget divided among the configured download workers, with a minimum of 128 MiB plus that cache allowance. The application sets aside the cache and overhead before splitting the remaining allowance between original media and previews. Cache files use the item's temporary directory and are removed with it. These reservations can limit active files below the configured worker counts; thumbnail work requires a staged budget larger than 1 GiB.
 
-If temporary cleanup fails, the affected filename appears in run warnings and its storage reservation remains held until final run cleanup succeeds. Cleanup warnings do not undo acknowledged uploads. If final cleanup fails too, remove the leftover run directory after stopping the server and resolving any file locks.
+Files waiting for storage reservations stay queued while admitted files finish downloading, converting, uploading, and cleaning up, even when those stages take longer than two minutes. Increasing the staged limit also increases each unknown-size file's reservation, so it does not by itself increase their concurrency. If no admitted files remain and available memory stays at or below 1 GiB for two minutes, waiting files fail with a memory-specific error.
+
+If temporary cleanup fails, the affected filename appears in run warnings and its storage reservation remains held until final run cleanup succeeds. Once no admitted files can release storage, files blocked by these retained reservations fail with a cleanup-specific error so the run can finish and attempt final cleanup. Cleanup warnings do not undo acknowledged uploads. If final cleanup fails too, remove the leftover run directory after stopping the server and resolving any file locks.
 
 If you see:
 

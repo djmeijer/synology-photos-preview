@@ -39,7 +39,7 @@ export interface JobDependencies {
   download: (item: MediaItem, source: string, signal: AbortSignal, maxBytes: number, progress: (percent: number | null, bytes?: number) => void) => Promise<void>;
   convert: (item: MediaItem, source: string, directory: string, signal: AbortSignal, progress: (percent: number | null, backend: string) => void) => Promise<Record<string, string>>;
   upload: (item: MediaItem, outputs: Record<string, string>, signal: AbortSignal, progress: (percent: number | null, bytes?: number) => void) => Promise<void>;
-  reserve?: (item: MediaItem, signal: AbortSignal) => Promise<{ release: () => void; maxBytes: number }>;
+  reserve?: (item: MediaItem, signal: AbortSignal) => Promise<{ release: () => void; retain?: () => void; maxBytes: number }>;
   refill?: (knownKeys: ReadonlySet<string>, signal: AbortSignal) => Promise<ConversionBatch>;
   refillIntervalMs?: number;
   cleanup?: (directory: string) => Promise<void>;
@@ -53,7 +53,9 @@ function workPriority(a: MediaItem, b: MediaItem) {
 }
 export class DiskBudget {
   private reserved = 0;
-  constructor(private settings: Settings, private directory: string) {}
+  private activeReservations = 0;
+  constructor(private settings: Settings, private directory: string,
+    private wait = (signal: AbortSignal) => delay(1000, undefined, { signal })) {}
   async acquire(item: MediaItem, signal: AbortSignal) {
     const budget = this.settings.maxStagedGiB * 1024 ** 3;
     const overhead = 64 * 1024 ** 2 + (item.component === 'photo' || item.needThumbnail ? imageCacheDiskBytes : 0);
@@ -66,14 +68,24 @@ export class DiskBudget {
       signal.throwIfAborted();
       const disk = await statfs(this.directory);
       const free = disk.bavail * disk.bsize;
-      if (free < this.settings.diskReserveGiB * 1024 ** 3 + needed && this.reserved === 0) throw new AppError('Insufficient free temporary storage. Free disk space or select another temporary directory.', 409);
+      if (this.reserved + needed > budget && this.activeReservations === 0) throw new AppError('Temporary storage remains reserved after cleanup failures. Finish or stop the run and resolve temporary-file cleanup before retrying.', 409);
+      if (free - this.reserved - needed < this.settings.diskReserveGiB * 1024 ** 3 && this.activeReservations === 0) throw new AppError('Insufficient free temporary storage. Free disk space or select another temporary directory.', 409);
       if (this.reserved + needed <= budget && free - this.reserved - needed >= this.settings.diskReserveGiB * 1024 ** 3 && os.freemem() > 1024 ** 3) {
         this.reserved += needed;
-        let released = false;
-        return { maxBytes: Math.floor((needed - overhead) / 2), release: () => { if (!released) { released = true; this.reserved -= needed; } } };
+        this.activeReservations++;
+        let released = false, retained = false;
+        return {
+          maxBytes: Math.floor((needed - overhead) / 2),
+          retain: () => { if (!released && !retained) { retained = true; this.activeReservations--; } },
+          release: () => { if (!released) { released = true; this.reserved -= needed; if (!retained) this.activeReservations--; } }
+        };
       }
-      if (++waits >= 120) throw new AppError('Resource pressure did not clear after two minutes. Reduce workers or increase temporary storage.', 409);
-      await delay(1000, undefined, { signal });
+      // Admitted files hold their reservations through upload and cleanup. Long
+      // conversions are normal queue backpressure, so keep waiting for them.
+      // Retained reservations cannot be released until final run cleanup.
+      if (this.activeReservations > 0) waits = 0;
+      else if (++waits >= 120) throw new AppError('Available memory stayed at or below 1 GiB for two minutes. Close other applications or reduce workers.', 409);
+      await this.wait(signal);
     }
   }
 }
@@ -225,7 +237,7 @@ export class ConversionJob extends EventEmitter {
         let item: ItemProgress | null;
         try { item = await this.takeNext(); } catch { break; }
         if (!item) break;
-        let itemDirectory: string | undefined, release: (() => void) | undefined;
+        let itemDirectory: string | undefined, release: (() => void) | undefined, retain: (() => void) | undefined;
         try {
           const signal = this.controller.signal;
           item.stage = 'waiting'; this.notify(true);
@@ -233,7 +245,7 @@ export class ConversionJob extends EventEmitter {
           await downloads.use(signal, async () => {
             await this.gate();
             const reservation = await (this.dependencies.reserve?.(item, signal) ?? disk.acquire(item, signal));
-            release = reservation.release; maxBytes = reservation.maxBytes;
+            release = reservation.release; retain = reservation.retain; maxBytes = reservation.maxBytes;
             await this.gate();
             itemDirectory = await mkdtemp(path.join(this.directory, 'item-'));
             // NAS filenames are labels only; never use them as filesystem paths.
@@ -278,7 +290,7 @@ export class ConversionJob extends EventEmitter {
               else await rm(itemDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
             } catch { cleaned = false; this.addWarning(`Temporary-file cleanup failed for ${item.filename}. Storage remains reserved until run cleanup succeeds.`); }
           }
-          if (cleaned) release?.(); else if (release) this.retainedReservations.push(release);
+          if (cleaned) release?.(); else if (release) { retain?.(); this.retainedReservations.push(release); }
           this.processing--; this.resetIdleConfirmation(); this.wakeWork(); this.notify(true);
         }
       }
