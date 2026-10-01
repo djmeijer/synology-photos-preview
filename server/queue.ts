@@ -6,7 +6,8 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, errorMessage } from './errors.ts';
 import { imageCacheDiskBytes } from './image-resources.ts';
-import { mediaDateWindowLimit, type ConversionBatch, type ItemProgress, type JobSnapshot, type Library, type MediaItem, type Settings, type SkippedMedia } from '../shared/types.ts';
+import type { ConversionBatch, ItemProgress, JobSnapshot, Library, MediaItem, Settings, SkippedMedia } from '../shared/types.ts';
+import { mediaDateRange } from '../shared/media-dates.ts';
 
 export class Semaphore {
   private active = 0;
@@ -100,10 +101,6 @@ export class ConversionJob extends EventEmitter {
   private lastNotification = 0;
   private downloadedBytes = 0;
   private uploadedBytes = 0;
-  private mediaDateFrom?: string;
-  private mediaDateTo?: string;
-  private recentMedia: MediaItem[] = [];
-  private mediaDateKnownCount = 0;
   private skippedKeys = new Set<string>();
   private warnings = new Set<string>();
   completion!: Promise<void>;
@@ -111,7 +108,6 @@ export class ConversionJob extends EventEmitter {
     super();
     const unique = new Map(items.map(item => [item.key, item]));
     const fetched = [...unique.values()];
-    this.setMediaDates(fetched);
     this.items = fetched.sort(workPriority).map(item => this.queuedItem(item));
     this.items.forEach(item => this.knownKeys.add(item.key));
     this.addSkipped(skipped);
@@ -125,15 +121,6 @@ export class ConversionJob extends EventEmitter {
   private wakeWork() { this.workWaiters.splice(0).forEach(resolve => resolve()); }
   private notify(force = false) {
     if (force || Date.now() - this.lastNotification > 250) { this.lastNotification = Date.now(); this.emit('change'); }
-  }
-  private setMediaDates(items: MediaItem[]) {
-    this.recentMedia = [...this.recentMedia, ...items].slice(-mediaDateWindowLimit);
-    const dates = this.recentMedia.flatMap(item => {
-      const timestamp = item.takenAt ? Date.parse(item.takenAt) : NaN;
-      return Number.isFinite(timestamp) ? [new Date(timestamp).toISOString()] : [];
-    }).sort();
-    this.mediaDateKnownCount = dates.length;
-    this.mediaDateFrom = dates[0]; this.mediaDateTo = dates.at(-1);
   }
   private queuedItem(item: MediaItem): ItemProgress {
     // Retry inputs can be ItemProgress objects; copy media fields only.
@@ -197,13 +184,22 @@ export class ConversionJob extends EventEmitter {
               addedItems.push(this.queuedItem(item));
               added++;
             }
-            if (addedItems.length) this.setMediaDates(addedItems);
             this.items.push(...addedItems.sort(workPriority));
             if (added) this.resetIdleConfirmation();
             this.nextRefillAt = added ? 0 : Date.now() + this.refillIntervalMs;
             // Only fresh requests made after all work settled can confirm exhaustion.
             if (!added && idleAtRequest && this.processing === 0 && revision === this.settlementRevision && this.status === 'running') {
-              if (++this.idleChecks >= 3) this.sourceDone = true;
+              if (++this.idleChecks >= 3) {
+                this.sourceDone = true;
+                const doneKeys = new Set(this.items.filter(item => item.stage === 'done').map(item => item.key));
+                const stillPending = discovered.knownPending ?? discovered.items;
+                for (const item of stillPending) {
+                  if (!doneKeys.has(item.key)) continue;
+                  const previews = [item.needThumbnail ? 'thumbnails' : '', item.needVideo ? 'H.264 video preview' : ''].filter(Boolean).join(' and ');
+                  if (!previews) continue;
+                  this.addWarning(`NAS still requests ${previews} for ${item.filename} (${item.space}, unit ${item.unitId}) after acknowledging its upload. The queue has not cleared for this file; Execute now may return it again.`);
+                }
+              }
             }
           } catch (error) {
             if (!this.controller.signal.aborted) this.verificationError = errorMessage(error);
@@ -298,6 +294,7 @@ export class ConversionJob extends EventEmitter {
   }
   failedItems() { return this.items.filter(item => item.stage === 'failed'); }
   snapshot(): JobSnapshot {
+    const active = this.items.filter(i => ['waiting', 'download', 'convert', 'upload'].includes(i.stage));
     const success = this.items.filter(i => i.stage === 'done').length;
     const failed = this.items.filter(i => i.stage === 'failed').length;
     const cancelled = this.items.filter(i => i.stage === 'cancelled').length;
@@ -307,9 +304,8 @@ export class ConversionJob extends EventEmitter {
       total: this.items.length, success, failed, cancelled, remaining, settledPercent: this.items.length ? (success + failed + cancelled) / this.items.length * 100 : 100,
       filesPerMinute: success / seconds * 60, etaSeconds: success > 0 && this.status === 'running' ? Math.round(remaining * seconds / success) : null,
       downloadedBytes: this.downloadedBytes, uploadedBytes: this.uploadedBytes, mibPerSecond: (this.downloadedBytes + this.uploadedBytes) / seconds / 1024 ** 2,
-      ...(this.mediaDateFrom && this.mediaDateTo ? { mediaDateFrom: this.mediaDateFrom, mediaDateTo: this.mediaDateTo } : {}),
-      mediaDateWindowCount: this.recentMedia.length, mediaDateKnownCount: this.mediaDateKnownCount,
+      ...mediaDateRange(active),
       skipped: this.skippedKeys.size, warnings: [...this.warnings],
-      active: this.items.filter(i => ['waiting', 'download', 'convert', 'upload'].includes(i.stage)), errors: this.failedItems(), verificationError: this.verificationError };
+      active, errors: this.failedItems(), verificationError: this.verificationError };
   }
 }

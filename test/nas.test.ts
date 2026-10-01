@@ -10,11 +10,14 @@ import { NasError } from '../server/errors.ts';
 const raw = (id: number, type: number | string = 0) => ({ unit_id: id, filename: `media-${id}.heic`, type, need_thumbnail: true, need_video: type === 1 });
 test('fetches one batch without requiring totals, offsets or pagination', async () => {
   let calls = 0;
+  const lookedUp: number[] = [];
   const items = await fetchConversionBatch(async (api, method, params) => {
     calls++;
     if (api.endsWith('Browse.Item')) {
       assert.equal(method, 'get');
-      assert.deepEqual(JSON.parse(params!.id), Array.from({ length: 100 }, (_, i) => i + 117));
+      const ids = JSON.parse(params!.id) as number[];
+      assert.ok(ids.length <= 100);
+      lookedUp.push(...ids);
       return { list: Array.from({ length: 217 }, (_, i) => ({ id: i, time: 1_609_459_200 + i * 86_400 })) };
     }
     assert.equal(api, 'SYNO.Foto.Upload.ConvertedFile');
@@ -22,9 +25,10 @@ test('fetches one batch without requiring totals, offsets or pagination', async 
     assert.equal(params!.offset, undefined);
     return { list: Array.from({ length: 217 }, (_, i) => raw(i)) };
   }, 'personal');
-  assert.equal(calls, 2);
+  assert.equal(calls, 4);
+  assert.deepEqual(lookedUp, Array.from({ length: 217 }, (_, i) => i));
   assert.equal(items.items.length, 217);
-  assert.equal(items.items[0].takenAt, undefined);
+  assert.equal(items.items[0].takenAt, '2021-01-01T00:00:00.000Z');
   assert.equal(items.items[117].takenAt, '2021-04-28T00:00:00.000Z');
   assert.equal(items.items.at(-1)?.takenAt, '2021-08-05T00:00:00.000Z');
 });
@@ -122,11 +126,21 @@ test('known work is excluded before date lookup and optional lookup honors cance
     assert.deepEqual(JSON.parse(params!.id), [2]); throw new Error('Optional lookup unavailable');
   }, 'personal', undefined, known);
   assert.deepEqual(result.items.map(item => item.unitId), [2]);
+  assert.deepEqual(result.knownPending?.map(item => item.key), ['personal:1:photo']);
   const controller = new AbortController();
   await assert.rejects(fetchConversionBatch(async api => {
     if (!api.endsWith('Browse.Item')) return { list: [raw(2)] };
     controller.abort(); throw controller.signal.reason;
   }, 'personal', controller.signal), { name: 'AbortError' });
+});
+
+test('completed flags are excluded from known pending verification', async () => {
+  const result = await fetchConversionBatch(async () => ({ list: [
+    { ...raw(1), need_thumbnail: false }, { ...raw(2, 1), need_thumbnail: false },
+    { ...raw(3, 1), need_thumbnail: false, need_video: false }
+  ] }), 'personal', undefined, new Set(['personal:1:photo', 'personal:2:video', 'personal:3:video']));
+  assert.deepEqual(result.items, []);
+  assert.deepEqual(result.knownPending?.map(item => [item.key, item.needThumbnail, item.needVideo]), [['personal:2:video', false, true]]);
 });
 
 test('the fallback device token is validated before constructing cookies', async t => {

@@ -82,15 +82,17 @@ If the application or computer restarts, unfinished items can be returned by the
 
 Synology Photos exposes a conversion work queue, not a reliable backlog count or conventional paginated list. The application calls `list_convert_needed` for the Windows preview preset. Synology chooses which pending items to return and may return fewer items than the requested limit.
 
-After a preview upload succeeds, Synology removes that work from its pending set. Later queue requests can then expose more items. Consequently:
+An acknowledged preview upload normally causes Synology to remove that work from its pending set. An acknowledgment alone does not prove the requested previews are ready. Later queue requests can then expose more items. Consequently:
 
 - The displayed total grows as new work becomes visible.
 - There is no verified full-backlog number before processing.
 - The application does not use an offset because affected Photos versions repeat items instead of returning a dependable next page.
-- **Dates of last N loaded files** shows the earliest and latest known media dates among the last 100 unique files fetched from the NAS, or fewer when the run has loaded fewer files. Photos and videos both count. Fetch order determines this window before scheduling changes processing order; repeated items do not move it. The window carries across refills and resets for a new run or retry.
-- Undated files count toward the date window but contribute no date. The interface reports partial date coverage or **Dates unavailable**; a one-day range displays one date. Dates use the browser's local timezone.
+- **Active files date range** shows the earliest and latest known media dates of the files currently waiting, downloading, converting, or uploading, matching the active-file table. It updates as files enter or leave that set and disappears when no files are active. Queued, completed, failed, and cancelled files do not contribute.
+- Undated active files contribute no date. The interface reports partial date coverage or **Dates unavailable**; a one-day range displays one date. Dates use the browser's local timezone. Optional missing-date lookups cover newly discovered files in groups of up to 100, so files at the start of a large batch can also have dates.
 - A slow file can briefly be the only visible item. The application checks again every two seconds and starts newly exposed work without another click.
 - Once all loaded work settles, three fresh checks at two-second intervals must discover no new supported items before the run finishes, taking approximately six seconds plus NAS response time. Newly discovered work resets these checks; pause suspends them and resume restarts them.
+- If the final check still lists a successfully uploaded file as needing previews, the run finishes with a warning containing its filename, NAS unit ID, and the preview types still requested. It is not converted repeatedly within that run. Executing again can return it because the NAS still considers it pending.
+- While idle and connected, `/api/queue?library=personal` (or `shared` / `both`) inspects the pending batch without downloading, converting, or uploading media. This is useful for diagnosing files that return after an acknowledged upload.
 - ETA covers currently discovered work. The NAS may expose more files after uploads finish, so ETA and totals can change during a run.
 
 Items are deduplicated during a run using `space:unitId:component`. Identical filenames can still represent different NAS library items and are therefore processed separately.

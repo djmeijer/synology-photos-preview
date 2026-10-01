@@ -99,6 +99,40 @@ test('successful batches continue automatically until the NAS returns no new wor
   assert.deepEqual(studio.job!.items.map(item => item.unitId), [1, 2]);
   assert.equal(studio.history.filter(run => run.status === 'completed').length, 1);
 });
+
+test('a NAS that repeatedly lists an uploaded movie cannot produce a clean completion', async t => {
+  const movie = { unit_id: 7, filename: 'recurring.mov', type: 'video', need_thumbnail: false, need_video: true, time: 1_609_459_200 };
+  const studio = await studioFixture(t), nas = await mockNas(t, { queueList: [movie] });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  const original = MediaConverter.prototype.convert;
+  MediaConverter.prototype.convert = async (_item, _source, dir) => {
+    const output = path.join(dir, 'film_h264.mp4'); await writeFile(output, 'preview'); return { film_h264: output };
+  };
+  t.after(() => { MediaConverter.prototype.convert = original; });
+  await studio.start({ library: 'personal' }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(nas.requests.filter(request => request.method === 'download').length, 1);
+  assert.equal(nas.requests.filter(request => request.method === 'upload').length, 1);
+  assert.equal(studio.job!.status, 'completed_with_errors');
+  assert.equal(studio.job!.snapshot().success, 1);
+  assert.match(studio.history[0].warnings![0], /recurring\.mov.*unit 7/);
+  const persisted = JSON.parse(await readFile(path.join(studio.dataDirectory, 'history.json'), 'utf8'));
+  assert.equal(persisted[0].status, 'completed_with_errors');
+  assert.match(persisted[0].warnings[0], /H\.264 video preview/);
+});
+
+test('pending inspection reports preview requirements without downloading or uploading', async t => {
+  const studio = await studioFixture(t), nas = await mockNas(t, { queueList: [
+    { unit_id: 7, filename: 'recurring.mov', type: 'video', need_thumbnail: false, need_video: true }
+  ] });
+  await assert.rejects(studio.inspectPending('personal'), /Connect to your NAS/);
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  const batch = await studio.inspectPending('personal');
+  assert.deepEqual(batch.items.map(item => [item.filename, item.unitId, item.needThumbnail, item.needVideo]), [['recurring.mov', 7, false, true]]);
+  assert.equal(studio.job, null);
+  assert.equal(nas.requests.filter(request => ['download', 'upload'].includes(request.method)).length, 0);
+  await assert.rejects(studio.inspectPending('invalid' as any), /Invalid library/);
+});
 test('restart requires login and preserves an interrupted summary without session tokens', async t => {
   const studio = await studioFixture(t);
   await writeJson(path.join(studio.dataDirectory, 'history.json'), [{ id: 'old', library: 'both', status: 'running', startedAt: new Date().toISOString(), total: 10, success: 4, failed: 1, cancelled: 0, remaining: 5, active: [], errors: [] }]);

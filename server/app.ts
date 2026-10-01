@@ -44,7 +44,7 @@ export class Studio extends EventEmitter {
       try { await access(portable); this.settings.magick = portable; } catch { /* Use PATH or the configured executable. */ }
     }
     this.history = await readJson(path.join(this.dataDirectory, 'history.json'), []);
-    this.history = this.history.map(run => ({ ...run, skipped: run.skipped ?? 0, warnings: run.warnings ?? [], mediaDateWindowCount: run.mediaDateWindowCount ?? 0, mediaDateKnownCount: run.mediaDateKnownCount ?? 0 }));
+    this.history = this.history.map(run => ({ ...run, skipped: run.skipped ?? 0, warnings: run.warnings ?? [], mediaDateActiveCount: run.mediaDateActiveCount ?? 0, mediaDateKnownCount: run.mediaDateKnownCount ?? 0 }));
     this.history = this.history.map(run => ['running', 'paused', 'stopping'].includes(run.status) ? {
       ...run, status: 'stopped', cancelled: run.cancelled + run.remaining, remaining: 0, active: [], settledPercent: 100,
       verificationError: 'The application restarted during this run. Connect and execute again to fetch pending work.'
@@ -109,7 +109,12 @@ export class Studio extends EventEmitter {
   private async fetchBatch(library: Library, signal?: AbortSignal, knownKeys?: ReadonlySet<string>): Promise<ConversionBatch> {
     const spaces = this.validateLibrary(library);
     const results = await Promise.all(spaces.map(space => fetchConversionBatch(this.nas!.request, space, signal, knownKeys)));
-    return { items: results.flatMap(result => result.items), skipped: results.flatMap(result => result.skipped) };
+    return { items: results.flatMap(result => result.items), skipped: results.flatMap(result => result.skipped),
+      knownPending: results.flatMap(result => result.knownPending ?? []) };
+  }
+  async inspectPending(library: Library = this.settings.library): Promise<ConversionBatch> {
+    this.ensureIdle();
+    return this.fetchBatch(library);
   }
   async start(input: unknown) {
     const options = validateJobInput(input);
@@ -195,6 +200,11 @@ export function createApp(studio: Studio, port = 4177) {
   });
   app.use(express.json({ limit: '32kb' }));
   app.get('/api/state', (_req, res) => res.json({ ...studio.state(), csrfToken: token }));
+  app.get('/api/queue', async (req, res) => {
+    const library = req.query.library;
+    if (library !== undefined && (typeof library !== 'string' || !['personal', 'shared', 'both'].includes(library))) throw new AppError('Invalid library.');
+    res.json(await studio.inspectPending(library as Library | undefined));
+  });
   app.get('/api/events', (req, res) => {
     res.set({ 'Content-Type': 'text/event-stream', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();

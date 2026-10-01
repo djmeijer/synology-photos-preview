@@ -12,7 +12,7 @@ export interface MediaItem {
   size?: number;
   takenAt?: string;
 }
-export const mediaDateWindowLimit = 100;
+export const mediaDateLookupBatchSize = 100;
 export interface SkippedMedia {
   key: string;
   space: Space;
@@ -23,6 +23,7 @@ export interface SkippedMedia {
 export interface ConversionBatch {
   items: MediaItem[];
   skipped: SkippedMedia[];
+  knownPending?: MediaItem[];
 }
 export interface Settings {
   nasUrl: string;
@@ -82,7 +83,7 @@ export interface JobSnapshot {
   mibPerSecond: number;
   mediaDateFrom?: string;
   mediaDateTo?: string;
-  mediaDateWindowCount?: number;
+  mediaDateActiveCount?: number;
   mediaDateKnownCount?: number;
   skipped?: number;
   warnings?: string[];

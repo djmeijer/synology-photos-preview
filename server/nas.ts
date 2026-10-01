@@ -7,7 +7,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, NasError } from './errors.ts';
-import { mediaDateWindowLimit, type Connection, type ConversionBatch, type MediaItem, type SkippedMedia, type Space } from '../shared/types.ts';
+import { mediaDateLookupBatchSize, type Connection, type ConversionBatch, type MediaItem, type SkippedMedia, type Space } from '../shared/types.ts';
 
 type ApiInfo = { path: string; minVersion: number; maxVersion: number };
 type ApiResponse = { success: boolean; error?: { code: number }; data: any };
@@ -81,22 +81,25 @@ export async function fetchConversionBatch(request: Request, space: Space, signa
     }
     items.set(item.key, item);
   }
-  const pending = [...items.values()].filter(item => !knownKeys.has(item.key) && (item.needThumbnail || item.needVideo));
-  const missingDates = pending.slice(-mediaDateWindowLimit).filter(item => !item.takenAt);
-  if (missingDates.length) {
+  const needed = [...items.values()].filter(item => item.needThumbnail || item.needVideo);
+  const knownPending = needed.filter(item => knownKeys.has(item.key));
+  const pending = needed.filter(item => !knownKeys.has(item.key));
+  const missingDates = pending.filter(item => !item.takenAt);
+  for (let offset = 0; offset < missingDates.length; offset += mediaDateLookupBatchSize) {
+    const lookup = missingDates.slice(offset, offset + mediaDateLookupBatchSize);
     try {
       const details = await request(API(space, 'Browse.Item'), 'get', {
-        id: JSON.stringify(missingDates.map(item => item.unitId))
+        id: JSON.stringify(lookup.map(item => item.unitId))
       }, signal);
       const byId = new Map((Array.isArray(details?.list) ? details.list : []).map((raw: any) => [Number(raw.id ?? raw.unit_id), raw]));
-      for (const item of missingDates) {
+      for (const item of lookup) {
         const takenAt = normalizeTakenAt(byId.get(item.unitId));
         if (takenAt) item.takenAt = takenAt;
       }
     } catch { signal?.throwIfAborted(); /* Optional dates must never block conversion. */ }
   }
   signal?.throwIfAborted();
-  return { items: pending, skipped: [...skipped.values()] };
+  return { items: pending, skipped: [...skipped.values()], ...(knownPending.length ? { knownPending } : {}) };
 }
 
 export class NasClient {

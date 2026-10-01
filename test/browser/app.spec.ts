@@ -37,11 +37,13 @@ test('OTP login, direct execution, pause/resume, browser refresh reconnects to t
   await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Execute now' })).toBeEnabled();
   await page.getByRole('button', { name: 'Execute now' }).click();
-  await expect(page.getByText(/Dates of last 100 loaded files:/)).toBeVisible();
+  await expect(page.getByText(/Active files date range:/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled();
   const original = await page.request.get('/api/state').then(r => r.json());
-  expect(original.job.mediaDateFrom).toBe('2020-01-21T00:00:00.000Z');
-  expect(original.job.mediaDateTo).toBe('2020-04-29T00:00:00.000Z');
+  const activeDates = original.job.active.map((item: { takenAt: string }) => new Date(item.takenAt).toISOString()).sort();
+  expect(original.job.mediaDateActiveCount).toBe(original.job.active.length);
+  expect(original.job.mediaDateFrom).toBe(activeDates[0]);
+  expect(original.job.mediaDateTo).toBe(activeDates.at(-1));
   await page.getByRole('button', { name: 'Pause', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeEnabled();
   await page.reload();
@@ -53,6 +55,7 @@ test('OTP login, direct execution, pause/resume, browser refresh reconnects to t
   await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
   await expect(page.getByText('stopped · Both spaces', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Active files date range:/)).toHaveCount(0);
   const stopped = await page.request.get('/api/state').then(r => r.json());
   expect(stopped.job.failed).toBe(0); expect(stopped.job.cancelled).toBeGreaterThan(0);
   await page.screenshot({ path: '.test-data/interface.png', fullPage: true });
@@ -77,12 +80,12 @@ test('missing dates, single-day ranges, and compatibility warnings are displayed
   for (const username of ['unknown-dates', 'one-day', 'warnings']) {
     await connect(page, username);
     await page.getByRole('button', { name: 'Execute now' }).click();
-    const dates = page.locator('p').filter({ hasText: /Dates of last 100 loaded files:/ });
+    const dates = page.locator('p').filter({ hasText: /Active files date range:/ });
     await expect(dates).toBeVisible();
     if (username === 'unknown-dates') await expect(dates).toContainText('Dates unavailable');
     if (username === 'one-day') {
       const formatted = await page.evaluate(() => new Date('2021-01-01T00:00:00Z').toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }));
-      await expect(dates).toHaveText(`Dates of last 100 loaded files: ${formatted}`);
+      await expect(dates).toHaveText(`Active files date range: ${formatted}`);
     }
     if (username === 'warnings') {
       await expect(page.getByText(/1 unsupported Live Photo video component/)).toBeVisible();
