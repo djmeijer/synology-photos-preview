@@ -75,3 +75,20 @@ test('benchmark fixtures generate only their two inputs with network access disa
   finally { globalThis.fetch = original; }
   assert.deepEqual((await readdir(directory)).sort(), ['photo.png', 'video.mp4']);
 });
+
+test('48-megapixel RGB photos spill to disk and generate all three thumbnails', { skip: process.env.MEDIA_TESTS !== '1', timeout: 120_000 }, async t => {
+  const settings = await localSettings(), hardware = await inspectHardware(settings);
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-large-photo-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'large.png');
+  // Q16 RGB pixels alone exceed the converter's 256 MiB memory allowance.
+  await command(settings.magick, ['-size', '8064x6048', 'gradient:#173b58-#eba980', `PNG24:${source}`]);
+  const item: MediaItem = { key: 'large-photo', unitId: 1, space: 'personal', component: 'photo', filename: 'large.png', needThumbnail: true, needVideo: false };
+  const outputs = await new MediaConverter(settings, hardware).convert(item, source, directory, new AbortController().signal, () => {});
+  assert.equal(Object.keys(outputs).length, 3);
+  for (const [key, output] of Object.entries(outputs)) {
+    assert.ok((await stat(output)).size > 0);
+    const dimensions = (await command(settings.magick, ['identify', '-format', '%w %h', output])).split(' ').map(Number);
+    assert.equal(Math.min(...dimensions), { thumb_sm: 240, thumb_m: 320, thumb_xl: 1280 }[key]);
+  }
+});

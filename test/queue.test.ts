@@ -24,6 +24,24 @@ test('starts expensive video work before photos to avoid a straggler tail', asyn
   const job = new ConversionJob('personal', input, defaults, dir, dependencies());
   assert.deepEqual(job.items.map(item => item.unitId), [3, 1, 2, 0]);
 });
+
+test('disk reservations account for image caches without consuming the media allowance', async t => {
+  const dir = await folder(t), signal = new AbortController().signal;
+  const photo = { ...items(1)[0], size: 1024 ** 2 };
+  const smallBudget = new DiskBudget({ ...defaults, maxStagedGiB: 1 }, dir);
+  await assert.rejects(smallBudget.acquire(photo, signal), /exceeds the staged-storage budget/);
+  await assert.rejects(smallBudget.acquire({ ...photo, size: undefined }, signal), /too small for the image cache/);
+  const budget = new DiskBudget({ ...defaults, maxStagedGiB: 4, downloads: 2 }, dir);
+  const known = await budget.acquire(photo, signal);
+  assert.equal(known.maxBytes, photo.size + 32 * 1024 ** 2);
+  known.release();
+  const unknown = await budget.acquire({ ...photo, size: undefined }, signal);
+  assert.equal(unknown.maxBytes, (1024 ** 3 - 64 * 1024 ** 2) / 2);
+  unknown.release();
+  const manyDownloads = new DiskBudget({ ...defaults, maxStagedGiB: 4, downloads: 16 }, dir);
+  const minimum = await manyDownloads.acquire({ ...photo, size: undefined }, signal);
+  assert.equal(minimum.maxBytes, 32 * 1024 ** 2); minimum.release();
+});
 test('independent stage limits, duplicate prevention, cleanup, transfer progress and success acknowledgments', async t => {
   const dir = await folder(t), settings = { ...defaults, downloads: 2, images: 3, videos: 2, uploads: 1 };
   const active = { download: 0, image: 0, video: 0, upload: 0 }, peak = { ...active };
@@ -216,7 +234,7 @@ test('refill failure drains admitted work and prevents a clean completion status
 test('small staged budgets give unknown-size downloads a positive allowance', async t => {
   const dir = await folder(t);
   const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 16, diskReserveGiB: 1 }, dir);
-  const reservation = await budget.acquire(items(1)[0], new AbortController().signal);
+  const reservation = await budget.acquire({ ...items(2)[1], needThumbnail: false }, new AbortController().signal);
   assert.equal(reservation.maxBytes, 32 * 1024 ** 2);
   reservation.release(); reservation.release();
 });

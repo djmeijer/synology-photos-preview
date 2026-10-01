@@ -164,7 +164,7 @@ Results are written to `.benchmarks/latest.json`. The benchmark does not change 
 
 Temporary files use `.data/work` unless **Temporary directory** is configured. Each item receives an isolated directory that is deleted after upload, failure, or cancellation.
 
-When Synology supplies a source size, the application reserves approximately twice that size plus 128 MiB. If the size is absent, its reservation is the staged-storage budget divided among the configured download workers, with a minimum of 128 MiB. The staged-storage budget can therefore limit active files below the configured worker counts. Some of each reservation is reserved for overhead; the rest is split between original media and generated previews.
+When Synology supplies a source size, the application reserves twice that size plus 128 MiB, with an additional 1 GiB for the ImageMagick disk cache when thumbnails are needed. If the size is absent, its reservation is the staged-storage budget divided among the configured download workers, with a minimum of 128 MiB plus that cache allowance. The application sets aside the cache and overhead before splitting the remaining allowance between original media and previews. Cache files use the item's temporary directory and are removed with it. These reservations can limit active files below the configured worker counts; thumbnail work requires a staged budget larger than 1 GiB.
 
 If temporary cleanup fails, the affected filename appears in run warnings and its storage reservation remains held until final run cleanup succeeds. Cleanup warnings do not undo acknowledged uploads. If final cleanup fails too, remove the leftover run directory after stopping the server and resolving any file locks.
 
@@ -186,6 +186,12 @@ increase **Staged storage limit**, reduce **Download workers**, or both. Also ma
 The runtime connects to the configured NAS. The default benchmark uses generated local fixtures. The optional real-media integration suite downloads the public libheif example HEIC image if it is not already cached under `.test-data/media`.
 
 ## Troubleshooting
+
+### ImageMagick reports `cache resources exhausted`
+
+Large photos can exceed ImageMagick's 256 MiB memory cache and require temporary disk caching. The app allows up to 1 GiB of disk cache per thumbnail conversion, including memory-mapped files, and includes that allowance in its staged-storage reservation. Older versions capped disk caching at 64 MiB, which could fail on high-resolution HEIC photos even with free RAM and disk space.
+
+Restart the server after updating, then retry failed items. If the error persists, ensure the temporary drive has free space and reduce **Image workers** to reduce simultaneous memory use. Exceptionally large images or a stricter ImageMagick `policy.xml` may still exceed the cache limits.
 
 ### A MOV file takes a long time
 

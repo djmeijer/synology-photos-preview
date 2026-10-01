@@ -4,6 +4,7 @@ import { rm } from 'node:fs/promises';
 import { command } from './process.ts';
 import { AppError } from './errors.ts';
 import { Semaphore } from './queue.ts';
+import { imageCacheEnvironment } from './image-resources.ts';
 import type { Hardware, MediaItem, Settings } from '../shared/types.ts';
 
 export interface VideoInfo { streamIndex: number; width: number; height: number; duration: number; rotation: number; hdr: boolean; }
@@ -92,7 +93,7 @@ export class MediaConverter {
     }
     // Decode once into ImageMagick's memory register; all three outputs reuse it.
     args.push('null:');
-    await command(this.settings.magick, args, { signal, env: { MAGICK_THREAD_LIMIT: '1', MAGICK_MEMORY_LIMIT: '256MiB', MAGICK_MAP_LIMIT: '256MiB', MAGICK_DISK_LIMIT: '64MiB', MAGICK_TEMPORARY_PATH: directory } });
+    await command(this.settings.magick, args, { signal, env: { ...imageCacheEnvironment, MAGICK_TEMPORARY_PATH: directory } });
     return outputs;
   }
   async convert(item: MediaItem, source: string, directory: string, signal: AbortSignal, report: (percent: number | null, backend: string) => void) {

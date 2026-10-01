@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, errorMessage } from './errors.ts';
+import { imageCacheDiskBytes } from './image-resources.ts';
 import { mediaDateWindowLimit, type ConversionBatch, type ItemProgress, type JobSnapshot, type Library, type MediaItem, type Settings, type SkippedMedia } from '../shared/types.ts';
 
 export class Semaphore {
@@ -54,7 +55,10 @@ export class DiskBudget {
   constructor(private settings: Settings, private directory: string) {}
   async acquire(item: MediaItem, signal: AbortSignal) {
     const budget = this.settings.maxStagedGiB * 1024 ** 3;
-    const needed = item.size ? item.size * 2 + 128 * 1024 ** 2 : Math.max(128 * 1024 ** 2, budget / this.settings.downloads);
+    const overhead = 64 * 1024 ** 2 + (item.component === 'photo' || item.needThumbnail ? imageCacheDiskBytes : 0);
+    const minimum = overhead + 64 * 1024 ** 2;
+    const needed = item.size ? item.size * 2 + minimum : Math.max(minimum, budget / this.settings.downloads);
+    if (!item.size && needed > budget) throw new AppError('Temporary-disk reservation is too small for the image cache. Increase max staged storage.', 409);
     if (needed > budget) throw new AppError('File exceeds the staged-storage budget. Increase max staged storage.', 409);
     let waits = 0;
     while (true) {
@@ -65,7 +69,7 @@ export class DiskBudget {
       if (this.reserved + needed <= budget && free - this.reserved - needed >= this.settings.diskReserveGiB * 1024 ** 3 && os.freemem() > 1024 ** 3) {
         this.reserved += needed;
         let released = false;
-        return { maxBytes: Math.floor((needed - 64 * 1024 ** 2) / 2), release: () => { if (!released) { released = true; this.reserved -= needed; } } };
+        return { maxBytes: Math.floor((needed - overhead) / 2), release: () => { if (!released) { released = true; this.reserved -= needed; } } };
       }
       if (++waits >= 120) throw new AppError('Resource pressure did not clear after two minutes. Reduce workers or increase temporary storage.', 409);
       await delay(1000, undefined, { signal });
