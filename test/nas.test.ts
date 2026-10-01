@@ -32,6 +32,24 @@ test('fetches one batch without requiring totals, offsets or pagination', async 
   assert.equal(items.items[117].takenAt, '2021-04-28T00:00:00.000Z');
   assert.equal(items.items.at(-1)?.takenAt, '2021-08-05T00:00:00.000Z');
 });
+test('optional dates are fetched with bounded concurrency and a failed lookup does not block the batch', async () => {
+  let active = 0, peak = 0, calls = 0;
+  const batch = await fetchConversionBatch(async api => {
+    if (!api.endsWith('Browse.Item')) return { list: Array.from({ length: 650 }, (_, index) => raw(index)) };
+    active++; peak = Math.max(peak, active);
+    const call = calls++;
+    try {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      if (call === 2) throw new Error('Optional lookup failed');
+      return { list: Array.from({ length: 100 }, (_, index) => ({ id: call * 100 + index, time: 1_609_459_200 })) };
+    } finally { active--; }
+  }, 'personal');
+  assert.equal(peak, 4); assert.equal(calls, 7); assert.equal(batch.items.length, 650);
+  assert.equal(batch.items[0].takenAt, '2021-01-01T00:00:00.000Z');
+  assert.equal(batch.items[200].takenAt, undefined);
+  assert.equal(batch.items[649].takenAt, '2021-01-01T00:00:00.000Z');
+});
+
 test('deduplicates batch identities and filters completed work', async () => {
   const items = await fetchConversionBatch(async () => ({ list: [raw(1), raw(1), { ...raw(2), need_thumbnail: false }, raw(3, 1)] }), 'shared');
   assert.deepEqual(items.items.map(item => item.key), ['shared:1:photo', 'shared:3:video']);
@@ -123,12 +141,50 @@ test('chunked oversized downloads stop within the allowance and request a growin
 });
 
 test('API upload acknowledgment is required and missing Shared APIs are explicit', async t => {
-  const { client } = await mockNas(t, { rejectUpload: true, advertisedShared: false }); await client.login('secret');
+  const { client, requests } = await mockNas(t, { rejectUpload: true, advertisedShared: false }); await client.login('secret');
   assert.deepEqual(client.connection.spaces, ['personal']); assert.match(client.connection.sharedReason!, /Shared/);
   const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-upload-test-')); t.after(() => rm(directory, { recursive: true, force: true }));
   const output = path.join(directory, 'preview.jpg'); await writeFile(output, 'jpeg');
   await assert.rejects(client.upload(normalizeItem(raw(1), 'personal'), { thumb_sm: output }, new AbortController().signal, () => {}), /access denied/);
+  assert.equal(requests.filter(request => request.method === 'upload').length, 1);
   await client.logout();
+});
+
+test('code 108 retries the complete preview upload once and keeps persistent rejection visible', async t => {
+  for (const persistent of [false, true]) {
+    await t.test(persistent ? 'persistent rejection' : 'temporary rejection', async t => {
+      const { client, requests } = await mockNas(t, { uploadCodes: persistent ? [108, 108] : [108, 0] });
+      await client.login('secret');
+      const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-upload-108-'));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const thumbnail = path.join(directory, 'thumb.jpg'), video = path.join(directory, 'film.mp4');
+      await writeFile(thumbnail, 'thumbnail-bytes'); await writeFile(video, 'video-preview-bytes');
+      const progress: number[] = [];
+      const uploading = client.upload(normalizeItem(raw(1, 1), 'personal'), { thumb_sm: thumbnail, film_h264: video }, new AbortController().signal, (_percent, bytes = 0) => progress.push(bytes));
+      if (persistent) await assert.rejects(uploading, (error: unknown) => {
+        assert.ok(error instanceof NasError); assert.equal(error.nasCode, 108);
+        assert.match(error.message, /file upload failed.*does not identify the cause/); return true;
+      });
+      else await uploading;
+      const uploads = requests.filter(request => request.method === 'upload');
+      assert.equal(uploads.length, 2);
+      for (const upload of uploads) {
+        assert.match(upload.body, /thumbnail-bytes/); assert.match(upload.body, /video-preview-bytes/);
+      }
+      assert.equal(progress.filter(bytes => bytes === 0).length, 2);
+      assert.equal(requests.filter(request => request.method === 'download').length, 0);
+      await client.logout();
+    });
+  }
+});
+
+test('Stop cancels a code 108 retry backoff before another upload starts', async () => {
+  const controller = new AbortController();
+  let attempts = 0, waits = 0;
+  await assert.rejects(retry(async () => { attempts++; throw new NasError(108, 'preview upload'); }, controller.signal, async () => {
+    waits++; controller.abort(); controller.signal.throwIfAborted();
+  }, error => error instanceof NasError && error.nasCode === 108), { name: 'AbortError' });
+  assert.equal(attempts, 1); assert.equal(waits, 1);
 });
 
 test('skips only recognized Live Photo components and deduplicates their identities', async () => {

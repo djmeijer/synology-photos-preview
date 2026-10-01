@@ -23,7 +23,7 @@ function normalizeTakenAt(raw: any): string | undefined {
   const date = new Date(timestamp);
   return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 }
-export async function retry<T>(operation: () => Promise<T>, signal?: AbortSignal, wait = (ms: number) => delay(ms, undefined, { signal })): Promise<T> {
+export async function retry<T>(operation: () => Promise<T>, signal?: AbortSignal, wait = (ms: number) => delay(ms, undefined, { signal }), canRetry = (_error: unknown) => false): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     signal?.throwIfAborted();
     try { return await operation(); }
@@ -31,7 +31,7 @@ export async function retry<T>(operation: () => Promise<T>, signal?: AbortSignal
       signal?.throwIfAborted();
       const e = error as { code?: string; response?: { status: number; headers?: Record<string, string> } };
       const status = e.response?.status;
-      if (attempt >= 3 || (!(status && ([408, 425, 429].includes(status) || status >= 500)) && !transientCodes.has(e.code ?? ''))) throw error;
+      if (attempt >= 3 || (!(status && ([408, 425, 429].includes(status) || status >= 500)) && !transientCodes.has(e.code ?? '') && !canRetry(error))) throw error;
       const header = e.response?.headers?.['retry-after'];
       const requested = header ? (Number.isFinite(Number(header)) ? Number(header) * 1000 : Date.parse(header) - Date.now()) : 0;
       await wait(Math.max(Math.min(30_000, 1000 * 2 ** attempt) * (0.5 + Math.random() * 0.5), Math.min(120_000, requested || 0)));
@@ -85,18 +85,26 @@ export async function fetchConversionBatch(request: Request, space: Space, signa
   const knownPending = needed.filter(item => knownKeys.has(item.key));
   const pending = needed.filter(item => !knownKeys.has(item.key));
   const missingDates = pending.filter(item => !item.takenAt);
-  for (let offset = 0; offset < missingDates.length; offset += mediaDateLookupBatchSize) {
-    const lookup = missingDates.slice(offset, offset + mediaDateLookupBatchSize);
+  // Optional metadata should not serialize admission of a large batch.
+  const lookup = async (items: MediaItem[]) => {
     try {
       const details = await request(API(space, 'Browse.Item'), 'get', {
-        id: JSON.stringify(lookup.map(item => item.unitId))
+        id: JSON.stringify(items.map(item => item.unitId))
       }, signal);
       const byId = new Map((Array.isArray(details?.list) ? details.list : []).map((raw: any) => [Number(raw.id ?? raw.unit_id), raw]));
-      for (const item of lookup) {
+      for (const item of items) {
         const takenAt = normalizeTakenAt(byId.get(item.unitId));
         if (takenAt) item.takenAt = takenAt;
       }
     } catch { signal?.throwIfAborted(); /* Optional dates must never block conversion. */ }
+  };
+  const parallelLookups = 4;
+  for (let offset = 0; offset < missingDates.length; offset += mediaDateLookupBatchSize * parallelLookups) {
+    await Promise.all(Array.from({ length: parallelLookups }, (_, group) => {
+      const start = offset + group * mediaDateLookupBatchSize;
+      const items = missingDates.slice(start, start + mediaDateLookupBatchSize);
+      return items.length ? lookup(items) : Promise.resolve();
+    }));
   }
   signal?.throwIfAborted();
   return { items: pending, skipped: [...skipped.values()], ...(knownPending.length ? { knownPending } : {}) };
@@ -193,6 +201,7 @@ export class NasClient {
     if (!Object.keys(outputs).length) throw new AppError('Conversion produced no previews.', 409);
     const api = API(item.space, 'Upload.ConvertedFile');
     const info = this.apiDetails(api);
+    let nasUploadRetries = 0;
     await retry(async () => {
       progress(0, 0);
       const streams = Object.fromEntries(Object.entries(outputs).map(([key, filename]) => [key, createReadStream(filename)]));
@@ -203,7 +212,12 @@ export class NasClient {
           onUploadProgress: e => progress(e.total ? e.loaded / e.total * 100 : null, e.loaded) });
         if (!response.data.success) throw new NasError(response.data.error?.code ?? 0, 'preview upload');
       } finally { Object.values(streams).forEach(stream => stream.destroy()); }
-    }, signal);
+    }, signal, undefined, error => {
+      // 108 is a generic upload failure, not proof that retrying will help.
+      // Try once with fresh streams; keep persistent failures and auth errors visible.
+      if (!(error instanceof NasError) || error.nasCode !== 108 || nasUploadRetries >= 1) return false;
+      nasUploadRetries++; return true;
+    });
   }
   async logout() {
     if (this.sid) {

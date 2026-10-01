@@ -11,6 +11,7 @@ export class NasError extends AppError {
     const detail = nasCode === 403 && operation === 'login' ? 'Two-factor authentication code required.'
       : [105, 106, 107, 119].includes(nasCode) ? 'Session expired or access denied. Reconnect and check Photos permissions.'
       : nasCode === 400 && operation === 'login' ? 'Incorrect username or password.'
+      : nasCode === 108 && operation === 'preview upload' ? 'NAS rejected preview upload (code 108: file upload failed). This code does not identify the cause.'
       : `NAS rejected ${operation} (code ${nasCode}).`;
     super(detail, [105, 106, 107, 119].includes(nasCode) ? 401 : 400, 'NAS_ERROR');
   }

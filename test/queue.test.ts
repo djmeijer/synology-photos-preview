@@ -455,7 +455,7 @@ test('a temporary queue echo that clears by the final check is a clean completio
   assert.deepEqual(job.snapshot().warnings, []);
 });
 
-test('a pending refill timer honors the new deadline after the last item settles', async t => {
+test('a pending refill timer is interrupted after the last item settles', async t => {
   const dir = await folder(t), interval = 60;
   let release!: () => void, firstPoll!: () => void, settledAt = 0;
   const held = new Promise<void>(resolve => { release = resolve; });
@@ -474,6 +474,45 @@ test('a pending refill timer honors the new deadline after the last item settles
   job.on('change', () => { if (!settledAt && job.snapshot().success === 1) settledAt = Date.now(); });
   await polled; await delay(30); release(); await job.completion;
   assert.equal(idlePolls.length, 3);
-  assert.ok(idlePolls[0] - settledAt >= interval - 5, 'First confirmation started before the idle deadline');
-  assert.ok(idlePolls[2] - settledAt >= interval * 3 - 10, 'Confirmation window ended too early');
+  assert.ok(idlePolls[0] - settledAt < interval / 2, 'First idle request waited for the old polling timer');
+  assert.ok(idlePolls[2] - settledAt >= interval * 2 - 10, 'Confirmation intervals ended too early');
+});
+
+test('new work exposed by the final upload is admitted immediately instead of waiting for the polling interval', { timeout: 5000 }, async t => {
+  const dir = await folder(t), base = dependencies();
+  let release!: () => void, firstPoll!: () => void, nextDownload!: () => void, uploaded = false;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const polled = new Promise<void>(resolve => { firstPoll = resolve; });
+  const downloaded = new Promise<void>(resolve => { nextDownload = resolve; });
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    refillIntervalMs: 1000,
+    download: async (...args) => { if (args[0].unitId === 1) nextDownload(); await base.download(...args); },
+    upload: async (...args) => { if (args[0].unitId === 0) { await held; uploaded = true; } await base.upload(...args); },
+    refill: async () => { firstPoll(); return { items: uploaded ? items(2).slice(1) : [], skipped: [] }; }
+  })).start();
+  t.after(() => { release(); job.stop(); });
+  await polled; await delay(30);
+  const releasedAt = Date.now(); release();
+  await downloaded;
+  assert.ok(Date.now() - releasedAt < 300, 'Next download waited for the one-second polling interval');
+  assert.equal(job.items.length, 2);
+  job.stop(); await job.completion;
+});
+
+test('fast idle discovery keeps final exhaustion checks separated by the confirmation interval', async t => {
+  const dir = await folder(t), confirmationInterval = 120;
+  const idlePolls: number[] = [];
+  const job = new ConversionJob('personal', items(1), defaults, dir, dependencies({
+    refillIntervalMs: 10,
+    idleConfirmationIntervalMs: confirmationInterval,
+    refill: async () => {
+      if (job.snapshot().remaining === 0) idlePolls.push(Date.now());
+      return { items: [], skipped: [] };
+    }
+  })).start();
+  t.after(() => job.stop());
+  await job.completion;
+  assert.equal(job.status, 'completed');
+  assert.ok(idlePolls.length > 3, 'Fast discovery stopped after only three closely spaced polls');
+  assert.ok(idlePolls.at(-1)! - idlePolls[0] >= confirmationInterval * 2, 'Final confirmation ran too soon');
 });

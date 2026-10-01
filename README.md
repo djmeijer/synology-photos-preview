@@ -88,9 +88,9 @@ An acknowledged preview upload normally causes Synology to remove that work from
 - There is no verified full-backlog number before processing.
 - The application does not use an offset because affected Photos versions repeat items instead of returning a dependable next page.
 - **Active files date range** shows the earliest and latest known media dates of the files currently waiting, downloading, converting, or uploading, matching the active-file table. It updates as files enter or leave that set and disappears when no files are active. Queued, completed, failed, and cancelled files do not contribute.
-- Undated active files contribute no date. The interface reports partial date coverage or **Dates unavailable**; a one-day range displays one date. Dates use the browser's local timezone. Optional missing-date lookups cover newly discovered files in groups of up to 100, so files at the start of a large batch can also have dates.
-- A slow file can briefly be the only visible item. The application checks again every two seconds and starts newly exposed work without another click.
-- Once all loaded work settles, three fresh checks at two-second intervals must discover no new supported items before the run finishes, taking approximately six seconds plus NAS response time. Newly discovered work resets these checks; pause suspends them and resume restarts them.
+- Undated active files contribute no date. The interface reports partial date coverage or **Dates unavailable**; a one-day range displays one date. Dates use the browser's local timezone. Optional missing-date lookups cover newly discovered files in groups of up to 100, with up to four groups fetched in parallel, so files at the start of a large batch can also have dates without serial metadata requests delaying admission.
+- A slow file can briefly be the only visible item. The application checks again every 500 ms and requests more work immediately when the last active file settles. Newly exposed work starts without another click. Final exhaustion still requires three fresh idle checks spaced at least two seconds apart; faster discovery does not shorten those intervals.
+- Once all loaded work settles, three fresh checks spaced at least two seconds apart must discover no new supported items before the run finishes. The first check starts immediately, so final confirmation takes approximately four seconds plus NAS response time. Newly discovered work resets these checks; pause suspends them and resume restarts them.
 - If the final check still lists a successfully uploaded file as needing previews, the run finishes with a warning containing its filename, NAS unit ID, and the preview types still requested. It is not converted repeatedly within that run. Executing again can return it because the NAS still considers it pending.
 - While idle and connected, `/api/queue?library=personal` (or `shared` / `both`) inspects the pending batch without downloading, converting, or uploading media. This is useful for diagnosing files that return after an acknowledged upload.
 - ETA covers currently discovered work. The NAS may expose more files after uploads finish, so ETA and totals can change during a run.
@@ -98,6 +98,8 @@ An acknowledged preview upload normally causes Synology to remove that work from
 Items are deduplicated during a run using `space:unitId:component`. Identical filenames can still represent different NAS library items and are therefore processed separately.
 
 An unsupported Live Photo video component is skipped with a warning and remains pending on the NAS. Supported files in the same response continue. Skipped components are counted separately and excluded from the supported-file total. A response containing only unsupported components explains the limitation without starting an empty run.
+
+To exclude a specific item from future runs, add an entry to `.data/skipped-media.json`, an array of objects with `nasUrl`, `username`, and `key` (for example, `personal:28450:video`). The NAS URL and username must match the saved connection settings. These exclusions apply to initial work, queue refills, pending inspection, and Retry failed, and are read again on every queue request. Other files with the same filename, different IDs, or another space/account/NAS remain eligible. Remove the entry to allow the item again. Excluded items remain unchanged and pending on the NAS; run warnings identify them as skipped by the user.
 
 Runs finish as `completed_with_errors` if files fail, components are skipped, fetching additional work fails, or temporary cleanup/history persistence reports a warning. Successful uploads remain successful. A failure to fetch additional work allows admitted files to finish; connect and execute again to fetch the remaining NAS work. Malformed queue responses and unknown media types remain compatibility errors.
 
@@ -208,7 +210,7 @@ Video-first scheduling prevents these files from starting at the end of a newly 
 
 ### The total stops with one or two MOV files remaining
 
-The NAS may temporarily expose only those remaining items. The application polls every two seconds. When their uploads cause Synology to expose more work, the total increases and processing continues automatically.
+The NAS may temporarily expose only those remaining items. The application polls every 500 ms and interrupts its polling delay when the last active file settles. When their uploads cause Synology to expose more work, the total increases and processing continues automatically.
 
 ### Two FFmpeg processes appear for one file
 
@@ -217,6 +219,10 @@ Chocolatey's `ffmpeg.exe` shim can appear as a parent process that launches the 
 ### An item appears to be processed again
 
 An interrupted conversion or an upload without a confirmed acknowledgment remains pending on the NAS and can be returned after restart. The application deliberately retries it rather than assuming an incomplete preview is valid. Files with the same name but different Synology unit IDs are distinct items.
+
+### NAS rejects a preview upload with code 108
+
+Synology's common API code 108 means file upload failed; it does not identify the underlying cause. The app retries this response once with a short backoff, reopening the existing preview files without downloading or converting the original again. A second code 108 response remains a failed item. Permission and session errors are not retried this way, and Stop cancels the backoff. If it persists, check available space on the NAS and Synology Photos logs before using Retry failed. Successfully uploaded files remain successful.
 
 ### Shared Space is unavailable
 

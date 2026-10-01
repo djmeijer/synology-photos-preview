@@ -106,11 +106,26 @@ export class Studio extends EventEmitter {
     if (spaces.some(space => !nas.connection.spaces.includes(space))) throw new AppError(nas.connection.sharedReason ?? 'Selected library is unavailable for this account.', 409, 'COMPATIBILITY');
     return spaces;
   }
+  private async userSkippedKeys(): Promise<Set<string>> {
+    const entries = await readJson<{ nasUrl: string; username: string; key: string }[]>(path.join(this.dataDirectory, 'skipped-media.json'), []);
+    if (!Array.isArray(entries) || entries.some(entry => !entry || typeof entry.nasUrl !== 'string' || typeof entry.username !== 'string' || !/^(personal|shared):\d+:(photo|video|live_video)$/.test(entry.key))) {
+      throw new AppError('The skipped-media file contains invalid entries.', 409);
+    }
+    return new Set(entries.filter(entry => entry.nasUrl === this.settings.nasUrl && entry.username === this.settings.username).map(entry => entry.key));
+  }
+  private skippedByUser(item: MediaItem): SkippedMedia {
+    const { key, space, unitId, filename } = item;
+    return { key, space, unitId, filename, reason: 'Skipped by user.' };
+  }
   private async fetchBatch(library: Library, signal?: AbortSignal, knownKeys?: ReadonlySet<string>): Promise<ConversionBatch> {
     const spaces = this.validateLibrary(library);
-    const results = await Promise.all(spaces.map(space => fetchConversionBatch(this.nas!.request, space, signal, knownKeys)));
-    return { items: results.flatMap(result => result.items), skipped: results.flatMap(result => result.skipped),
-      knownPending: results.flatMap(result => result.knownPending ?? []) };
+    const skippedKeys = await this.userSkippedKeys();
+    const excluded = new Set([...knownKeys ?? [], ...skippedKeys]);
+    const results = await Promise.all(spaces.map(space => fetchConversionBatch(this.nas!.request, space, signal, excluded)));
+    const pending = results.flatMap(result => result.knownPending ?? []);
+    return { items: results.flatMap(result => result.items),
+      skipped: [...results.flatMap(result => result.skipped), ...pending.filter(item => skippedKeys.has(item.key)).map(item => this.skippedByUser(item))],
+      knownPending: pending.filter(item => !skippedKeys.has(item.key)) };
   }
   async inspectPending(library: Library = this.settings.library): Promise<ConversionBatch> {
     this.ensureIdle();
@@ -127,7 +142,10 @@ export class Studio extends EventEmitter {
         if (!this.job || !this.job.failedItems().length) throw new AppError('No failed files to retry.', 409);
         library = this.job.library;
         this.validateLibrary(library);
-        items = this.job.failedItems();
+        const skippedKeys = await this.userSkippedKeys();
+        const failed = this.job.failedItems();
+        items = failed.filter(item => !skippedKeys.has(item.key));
+        skipped = failed.filter(item => skippedKeys.has(item.key)).map(item => this.skippedByUser(item));
       } else {
         library = options.library ?? this.settings.library;
         this.validateLibrary(library);
@@ -136,7 +154,7 @@ export class Studio extends EventEmitter {
         this.settings = settings;
         ({ items, skipped } = await this.fetchBatch(library));
       }
-      if (!items.length) throw new AppError(skipped.length ? `No supported pending previews. ${skipped.length} unsupported Live Photo video component(s) remain on the NAS.` : 'The NAS returned no pending previews for the selected space.', 409);
+      if (!items.length) throw new AppError(skipped.length ? `No supported pending previews to process. ${skipped.length} file(s) or component(s) are skipped and remain pending on the NAS.` : 'The NAS returned no pending previews for the selected space.', 409);
       const batch = await this.launchBatch(library, items, skipped);
       this.batchLoop = this.continueBatches(batch.job, batch.directory);
     } finally { this.starting = false; this.changed(); }

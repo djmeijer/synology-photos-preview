@@ -42,6 +42,7 @@ export interface JobDependencies {
   reserve?: (item: MediaItem, signal: AbortSignal) => Promise<{ release: () => void; retain?: () => void; maxBytes: number }>;
   refill?: (knownKeys: ReadonlySet<string>, signal: AbortSignal) => Promise<ConversionBatch>;
   refillIntervalMs?: number;
+  idleConfirmationIntervalMs?: number;
   cleanup?: (directory: string) => Promise<void>;
 }
 function workPriority(a: MediaItem, b: MediaItem) {
@@ -107,7 +108,9 @@ export class ConversionJob extends EventEmitter {
   private retries: ItemProgress[] = [];
   private refill: Promise<void> | null = null;
   private nextRefillAt = 0;
+  private refillWaitController?: AbortController;
   private idleChecks = 0;
+  private nextIdleCheckAt = 0;
   private settlementRevision = 0;
   private retainedReservations: (() => void)[] = [];
   private knownKeys = new Set<string>();
@@ -153,10 +156,18 @@ export class ConversionJob extends EventEmitter {
       this.warnings.add(`Skipped ${item.filename} (${item.space}, unit ${item.unitId}): ${item.reason}`);
     }
   }
-  private get refillIntervalMs() { return this.dependencies.refillIntervalMs ?? 2000; }
+  private get refillIntervalMs() { return this.dependencies.refillIntervalMs ?? 500; }
+  private get idleConfirmationIntervalMs() { return this.dependencies.idleConfirmationIntervalMs ?? this.dependencies.refillIntervalMs ?? 2000; }
   private resetIdleConfirmation() {
-    this.idleChecks = 0; this.settlementRevision++;
-    if (this.processing === 0) this.nextRefillAt = Date.now() + this.refillIntervalMs;
+    this.idleChecks = 0; this.nextIdleCheckAt = 0; this.settlementRevision++;
+    if (this.processing === 0) { this.nextRefillAt = 0; this.refillWaitController?.abort(); }
+  }
+  private async waitForRefill(ms: number) {
+    const controller = new AbortController();
+    this.refillWaitController = controller;
+    try { await delay(ms, undefined, { signal: AbortSignal.any([this.controller.signal, controller.signal]) }); }
+    catch (error) { this.controller.signal.throwIfAborted(); if (!controller.signal.aborted) throw error; }
+    finally { if (this.refillWaitController === controller) this.refillWaitController = undefined; }
   }
   releaseRetainedReservations() { this.retainedReservations.splice(0).forEach(release => release()); }
   private async gate() {
@@ -179,12 +190,12 @@ export class ConversionJob extends EventEmitter {
       if (!this.refill) {
         this.refill = (async () => {
           try {
-            // Settling work or resuming can move the deadline while a timer is pending.
+            // Finishing the last item or resuming interrupts an old polling delay.
             while (true) {
               await this.gate();
               const wait = this.nextRefillAt - Date.now();
               if (wait <= 0) break;
-              await delay(wait, undefined, { signal: this.controller.signal });
+              await this.waitForRefill(wait);
             }
             const revision = this.settlementRevision;
             const idleAtRequest = this.processing === 0;
@@ -201,9 +212,10 @@ export class ConversionJob extends EventEmitter {
             }
             this.items.push(...addedItems.sort(workPriority));
             if (added) this.resetIdleConfirmation();
-            this.nextRefillAt = added ? 0 : Date.now() + this.refillIntervalMs;
+            this.nextRefillAt = added || (this.processing === 0 && revision !== this.settlementRevision) ? 0 : Date.now() + this.refillIntervalMs;
             // Only fresh requests made after all work settled can confirm exhaustion.
-            if (!added && idleAtRequest && this.processing === 0 && revision === this.settlementRevision && this.status === 'running') {
+            if (!added && idleAtRequest && this.processing === 0 && revision === this.settlementRevision && this.status === 'running' && Date.now() >= this.nextIdleCheckAt) {
+              this.nextIdleCheckAt = Date.now() + this.idleConfirmationIntervalMs;
               if (++this.idleChecks >= 3) {
                 this.sourceDone = true;
                 const doneKeys = new Set(this.items.filter(item => item.stage === 'done').map(item => item.key));

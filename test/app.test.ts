@@ -11,7 +11,7 @@ import { MediaConverter } from '../server/media.ts';
 import { command } from '../server/process.ts';
 import { validateSettings, writeJson } from '../server/settings.ts';
 import { AppError } from '../server/errors.ts';
-import type { Hardware } from '../shared/types.ts';
+import type { Hardware, MediaItem } from '../shared/types.ts';
 
 const hardware: Hardware = { cpu: 'test', logicalCpus: 8, memoryGiB: 32, gpu: null, ffmpeg: true, ffprobe: true, magick: true, heic: true, nvenc: false, cudaScale: false, hdrFilters: true, warnings: [] };
 async function studioFixture(t: test.TestContext) {
@@ -100,6 +100,23 @@ test('successful batches continue automatically until the NAS returns no new wor
   assert.equal(studio.history.filter(run => run.status === 'completed').length, 1);
 });
 
+test('a temporary code 108 rejection retries upload without repeating download or conversion', async t => {
+  const studio = await studioFixture(t), nas = await mockNas(t, { queueBatches: [[1], []], uploadCodes: [108, 0] });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  let conversions = 0;
+  t.mock.method(MediaConverter.prototype, 'convert', async (_item: MediaItem, _source: string, dir: string) => {
+    conversions++;
+    const output = path.join(dir, 'preview.jpg'); await writeFile(output, 'preview'); return { thumb_sm: output };
+  });
+  await studio.start({ library: 'personal' }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(studio.job!.status, 'completed'); assert.equal(studio.job!.snapshot().success, 1);
+  assert.equal(conversions, 1);
+  assert.equal(nas.requests.filter(request => request.method === 'download').length, 1);
+  assert.equal(nas.requests.filter(request => request.method === 'upload').length, 2);
+  assert.deepEqual(await readdir(path.join(studio.dataDirectory, 'work')), []);
+});
+
 test('a NAS that repeatedly lists an uploaded movie cannot produce a clean completion', async t => {
   const movie = { unit_id: 7, filename: 'recurring.mov', type: 'video', need_thumbnail: false, need_video: true, time: 1_609_459_200 };
   const studio = await studioFixture(t), nas = await mockNas(t, { queueList: [movie] });
@@ -133,6 +150,62 @@ test('pending inspection reports preview requirements without downloading or upl
   assert.equal(nas.requests.filter(request => ['download', 'upload'].includes(request.method)).length, 0);
   await assert.rejects(studio.inspectPending('invalid' as any), /Invalid library/);
 });
+test('saved skips survive new Studio instances and identify the exact NAS, account, space and media ID', async t => {
+  const movie = { unit_id: 7, filename: 'recurring.mov', type: 'video', need_thumbnail: false, need_video: true };
+  const studio = await studioFixture(t), nas = await mockNas(t, { queueList: [movie] });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  await writeJson(path.join(studio.dataDirectory, 'skipped-media.json'), [{ nasUrl: nas.url, username: 'test-user', key: 'personal:7:video' }]);
+  const batch = await studio.inspectPending('both');
+  assert.deepEqual(batch.items.map(item => item.key), ['shared:7:video']);
+  assert.equal(batch.skipped.length, 1); assert.equal(batch.skipped[0].key, 'personal:7:video');
+  assert.match(batch.skipped[0].reason, /Skipped by user/);
+  assert.deepEqual(batch.knownPending, []);
+  await assert.rejects(studio.start({ library: 'personal' }), /1 file\(s\) or component\(s\) are skipped/);
+  assert.equal(studio.job, null);
+  const restarted = new Studio(studio.dataDirectory);
+  t.after(() => restarted.shutdown());
+  await restarted.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  assert.equal((await restarted.inspectPending('personal')).items.length, 0);
+  await restarted.disconnect();
+  await restarted.connect({ url: nas.url, username: 'other-user', password: 'secret' });
+  assert.equal((await restarted.inspectPending('personal')).items.length, 1);
+  const anotherNas = await mockNas(t, { queueList: [movie] });
+  await restarted.disconnect();
+  await restarted.connect({ url: anotherNas.url, username: 'test-user', password: 'secret' });
+  assert.equal((await restarted.inspectPending('personal')).items.length, 1);
+  assert.equal(nas.requests.filter(request => ['download', 'upload'].includes(request.method)).length, 0);
+});
+
+test('saved skips let other files run and apply to refills, verification and Retry failed', async t => {
+  const movie = { unit_id: 7, filename: 'recurring.mov', type: 'video', need_thumbnail: false, need_video: true, time: 1_609_459_200 };
+  const photo = { unit_id: 1, filename: 'regular.jpg', type: 'photo', need_thumbnail: true, time: 1_609_459_200 };
+  const studio = await studioFixture(t), nas = await mockNas(t, { queueList: [movie, photo] });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  const convert = t.mock.method(MediaConverter.prototype, 'convert', async () => { throw new AppError('Deliberate failure'); });
+  await studio.start({ library: 'personal' }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(studio.job!.snapshot().failed, 2);
+  await writeJson(path.join(studio.dataDirectory, 'skipped-media.json'), [{ nasUrl: nas.url, username: 'test-user', key: 'personal:7:video' }]);
+  convert.mock.mockImplementation(async (_item, _source, dir) => {
+    const output = path.join(dir, 'preview.jpg'); await writeFile(output, 'preview'); return { thumb_sm: output };
+  });
+  await studio.start({ retryFailed: true }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(studio.job!.items.map(item => item.unitId), [1]);
+  assert.equal(studio.job!.snapshot().success, 1); assert.equal(studio.job!.snapshot().skipped, 1);
+  const warnings = studio.job!.snapshot().warnings!;
+  assert.ok(warnings.some(warning => /recurring\.mov.*Skipped by user/.test(warning)));
+  assert.ok(!warnings.some(warning => /NAS still requests.*unit 7/.test(warning)));
+  assert.equal(nas.requests.filter(request => request.method === 'download' && request.params.get('unit_id') === '[7]').length, 1);
+  assert.equal(nas.requests.filter(request => request.method === 'upload').length, 1);
+  // A normal execution also excludes the movie, and removing the entry restores it.
+  await studio.start({ library: 'personal' }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(studio.job!.items.map(item => item.unitId), [1]);
+  await writeJson(path.join(studio.dataDirectory, 'skipped-media.json'), []);
+  assert.deepEqual((await studio.inspectPending('personal')).items.map(item => item.unitId), [7, 1]);
+});
+
 test('restart requires login and preserves an interrupted summary without session tokens', async t => {
   const studio = await studioFixture(t);
   await writeJson(path.join(studio.dataDirectory, 'history.json'), [{ id: 'old', library: 'both', status: 'running', startedAt: new Date().toISOString(), total: 10, success: 4, failed: 1, cancelled: 0, remaining: 5, active: [], errors: [] }]);
