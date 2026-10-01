@@ -7,7 +7,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, NasError } from './errors.ts';
-import type { Connection, MediaItem, Space } from '../shared/types.ts';
+import { mediaDateWindowLimit, type Connection, type ConversionBatch, type MediaItem, type SkippedMedia, type Space } from '../shared/types.ts';
 
 type ApiInfo = { path: string; minVersion: number; maxVersion: number };
 type ApiResponse = { success: boolean; error?: { code: number }; data: any };
@@ -45,10 +45,11 @@ export function normalizeUrl(value: string): string {
   return url.origin;
 }
 export function normalizeItem(raw: any, space: Space): MediaItem {
-  const unitId = Number(raw.unit_id);
-  if (!Number.isSafeInteger(unitId) || unitId < 0 || typeof raw.filename !== 'string') throw new AppError('NAS returned an unrecognized queue item.', 409, 'COMPATIBILITY');
-  const component = raw.type === 0 || raw.type === 'photo' ? 'photo'
-    : raw.type === 'live_video' || raw.is_live_video === true ? 'live_video'
+  const rawId = raw?.unit_id;
+  const unitId = typeof rawId === 'number' || (typeof rawId === 'string' && /^\d+$/.test(rawId)) ? Number(rawId) : NaN;
+  if (!Number.isSafeInteger(unitId) || unitId < 0 || typeof raw?.filename !== 'string') throw new AppError('NAS returned an unrecognized queue item.', 409, 'COMPATIBILITY');
+  const component = raw.type === 'live_video' || raw.is_live_video === true ? 'live_video'
+    : raw.type === 0 || raw.type === 'photo' ? 'photo'
     : raw.type === 1 || raw.type === 'video' ? 'video' : null;
   // Numeric types other than the repo's known 0/1 are deliberately not guessed.
   if (!component) throw new AppError(`Unsupported NAS media type for ${raw.filename}.`, 409, 'COMPATIBILITY');
@@ -56,7 +57,6 @@ export function normalizeItem(raw: any, space: Space): MediaItem {
   const needThumbnail = raw.need_thumbnail == null ? component === 'photo' : flag(raw.need_thumbnail);
   const needVideo = flag(raw.need_video);
   if (component === 'photo' && needVideo) throw new AppError('NAS returned video work for a photo component.', 409, 'COMPATIBILITY');
-  if (component === 'live_video') throw new AppError('This NAS returned a separate Live Photo video component. Its download/upload contract must be verified before processing.', 409, 'COMPATIBILITY');
   const size = Number(raw.filesize ?? raw.size);
   const takenAt = normalizeTakenAt(raw);
   return { key: `${space}:${unitId}:${component}`, space, unitId, component, filename: raw.filename,
@@ -64,19 +64,25 @@ export function normalizeItem(raw: any, space: Space): MediaItem {
 }
 
 /** Fetch the work offered now; this endpoint may ignore pagination parameters. */
-export async function fetchConversionBatch(request: Request, space: Space, signal?: AbortSignal): Promise<MediaItem[]> {
+export async function fetchConversionBatch(request: Request, space: Space, signal?: AbortSignal, knownKeys: ReadonlySet<string> = new Set()): Promise<ConversionBatch> {
   signal?.throwIfAborted();
   const data = await request(API(space, 'Upload.ConvertedFile'), 'list_convert_needed', {
     type: JSON.stringify(['photo', 'video', 'live_video']), preset: 'windows', limit: '500'
   }, signal);
   if (!Array.isArray(data?.list)) throw new AppError('NAS conversion queue response is unsupported.', 409, 'COMPATIBILITY');
   const items = new Map<string, MediaItem>();
+  const skipped = new Map<string, SkippedMedia>();
   for (const raw of data.list) {
     const item = normalizeItem(raw, space);
+    if (item.component === 'live_video') {
+      skipped.set(item.key, { key: item.key, space, unitId: item.unitId, filename: item.filename,
+        reason: 'Separate Live Photo video components have no verified download/upload contract.' });
+      continue;
+    }
     items.set(item.key, item);
   }
-  const pending = [...items.values()].filter(item => item.needThumbnail || item.needVideo);
-  const missingDates = pending.filter(item => !item.takenAt);
+  const pending = [...items.values()].filter(item => !knownKeys.has(item.key) && (item.needThumbnail || item.needVideo));
+  const missingDates = pending.slice(-mediaDateWindowLimit).filter(item => !item.takenAt);
   if (missingDates.length) {
     try {
       const details = await request(API(space, 'Browse.Item'), 'get', {
@@ -87,9 +93,10 @@ export async function fetchConversionBatch(request: Request, space: Space, signa
         const takenAt = normalizeTakenAt(byId.get(item.unitId));
         if (takenAt) item.takenAt = takenAt;
       }
-    } catch { /* Dates improve progress context but must never block conversion. */ }
+    } catch { signal?.throwIfAborted(); /* Optional dates must never block conversion. */ }
   }
-  return pending;
+  signal?.throwIfAborted();
+  return { items: pending, skipped: [...skipped.values()] };
 }
 
 export class NasClient {
@@ -125,8 +132,9 @@ export class NasClient {
     if (!auth.data.success) throw new NasError(auth.data.error?.code ?? 0, 'login');
     const data = auth.data.data;
     if (!data?.sid || !data?.synotoken) throw new AppError('NAS login response lacks a session or security token.', 409, 'COMPATIBILITY');
-    if ([data.sid, data.synotoken, data.device_id ?? ''].some(value => typeof value !== 'string' || /[\r\n;]/.test(value))) throw new AppError('NAS returned invalid session tokens.', 409, 'COMPATIBILITY');
-    this.sid = data.sid; this.did = data.device_id ?? data.did ?? ''; this.token = data.synotoken;
+    const did = data.device_id ?? data.did ?? '';
+    if ([data.sid, data.synotoken, did].some(value => typeof value !== 'string' || /[\r\n;]/.test(value))) throw new AppError('NAS returned invalid session tokens.', 409, 'COMPATIBILITY');
+    this.sid = data.sid; this.did = did; this.token = data.synotoken;
     try {
       const info = await this.client.post<ApiResponse>('/webapi/query.cgi', new URLSearchParams({ api: 'SYNO.API.Info', version: '1', method: 'query', query: 'all' }), { headers: this.headers() });
       if (!info.data.success) throw new NasError(info.data.error?.code ?? 0, 'API discovery');
@@ -152,6 +160,7 @@ export class NasClient {
   async download(item: MediaItem, destination: string, signal: AbortSignal, maxBytes: number, progress: (percent: number | null, bytes?: number) => void) {
     const info = this.apiDetails(API(item.space, 'Download'));
     await retry(async () => {
+      progress(0, 0);
       await rm(destination, { force: true });
       const response = await this.client.get(`/webapi/${info.path}`, { params: {
         api: API(item.space, 'Download'), version: '1', method: 'download', unit_id: JSON.stringify([item.unitId])
@@ -177,6 +186,7 @@ export class NasClient {
     const api = API(item.space, 'Upload.ConvertedFile');
     const info = this.apiDetails(api);
     await retry(async () => {
+      progress(0, 0);
       const streams = Object.fromEntries(Object.entries(outputs).map(([key, filename]) => [key, createReadStream(filename)]));
       try {
         const response = await this.client.postForm<ApiResponse>(`/webapi/${info.path}`, {

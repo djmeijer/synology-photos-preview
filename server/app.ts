@@ -9,7 +9,7 @@ import { defaults, readJson, validateSettings, writeJson } from './settings.ts';
 import { fetchConversionBatch, NasClient } from './nas.ts';
 import { inspectHardware, MediaConverter } from './media.ts';
 import { ConversionJob } from './queue.ts';
-import type { AppState, Hardware, JobSnapshot, Library, MediaItem, Settings, Space } from '../shared/types.ts';
+import type { AppState, ConversionBatch, Hardware, JobSnapshot, Library, MediaItem, Settings, SkippedMedia, Space } from '../shared/types.ts';
 
 export const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export class Studio extends EventEmitter {
@@ -89,16 +89,20 @@ export class Studio extends EventEmitter {
     if (spaces.some(space => !nas.connection.spaces.includes(space))) throw new AppError(nas.connection.sharedReason ?? 'Selected library is unavailable for this account.', 409, 'COMPATIBILITY');
     return spaces;
   }
-  private async fetchBatch(library: Library, signal?: AbortSignal): Promise<MediaItem[]> {
-    const items: MediaItem[] = [];
-    for (const space of this.validateLibrary(library)) items.push(...await fetchConversionBatch(this.nas!.request, space, signal));
-    return items;
+  private async fetchBatch(library: Library, signal?: AbortSignal, knownKeys?: ReadonlySet<string>): Promise<ConversionBatch> {
+    const batch: ConversionBatch = { items: [], skipped: [] };
+    for (const space of this.validateLibrary(library)) {
+      const result = await fetchConversionBatch(this.nas!.request, space, signal, knownKeys);
+      batch.items.push(...result.items); batch.skipped.push(...result.skipped);
+    }
+    return batch;
   }
   async start(input: { library?: Library; retryFailed?: boolean }) {
     this.ensureIdle(); this.starting = true; this.changed();
     try {
       if (!this.nas?.connection.connected) throw new AppError('Connect to your NAS first.', 401);
       let items: MediaItem[], library: Library;
+      let skipped: SkippedMedia[] = [];
       if (input.retryFailed) {
         if (!this.job || !this.job.failedItems().length) throw new AppError('No failed files to retry.', 409);
         library = this.job.library;
@@ -106,14 +110,14 @@ export class Studio extends EventEmitter {
         items = this.job.failedItems();
       } else {
         library = input.library ?? this.settings.library;
-        items = await this.fetchBatch(library);
+        ({ items, skipped } = await this.fetchBatch(library));
       }
-      if (!items.length) throw new AppError('The NAS returned no pending previews for the selected space.', 409);
-      const batch = await this.launchBatch(library, items);
+      if (!items.length) throw new AppError(skipped.length ? `No supported pending previews. ${skipped.length} unsupported Live Photo video component(s) remain on the NAS.` : 'The NAS returned no pending previews for the selected space.', 409);
+      const batch = await this.launchBatch(library, items, skipped);
       this.batchLoop = this.continueBatches(batch.job, batch.directory);
     } finally { this.starting = false; this.changed(); }
   }
-  private async launchBatch(library: Library, items: MediaItem[]) {
+  private async launchBatch(library: Library, items: MediaItem[], skipped: SkippedMedia[]) {
       if (!this.hardware?.ffmpeg || !this.hardware.ffprobe || !this.hardware.magick) throw new AppError('Configure FFmpeg, FFprobe, and ImageMagick before executing.', 409);
       if (!this.hardware.heic && items.some(item => /\.(heic|heif)$/i.test(item.filename))) throw new AppError('HEIC photos require an ImageMagick build with HEIC reading support.', 409);
       const tempRoot = path.resolve(this.settings.tempDirectory || path.join(this.dataDirectory, 'work'));
@@ -124,8 +128,8 @@ export class Studio extends EventEmitter {
       const converter = new MediaConverter(this.settings, this.hardware);
       const job = new ConversionJob(library, items, this.settings, runDirectory, {
         download: nas.download.bind(nas), convert: converter.convert.bind(converter), upload: nas.upload.bind(nas),
-        refill: async (_knownKeys, signal) => this.shuttingDown ? [] : this.fetchBatch(library, signal)
-      });
+        refill: async (knownKeys, signal) => this.shuttingDown ? { items: [], skipped: [] } : this.fetchBatch(library, signal, knownKeys)
+      }, skipped);
       this.job = job;
       let lastCheckpoint = Date.now();
       job.on('change', () => {

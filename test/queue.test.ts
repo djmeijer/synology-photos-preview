@@ -61,7 +61,7 @@ test('refills the queue while a slow file is still processing', async t => {
     download: async (...args) => { downloaded.add(args[0].unitId); await base.download(...args); },
     convert: async (...args) => { if (args[0].unitId === 0) await slow; return base.convert(...args); },
     refillIntervalMs: 5,
-    refill: async () => ++refillCalls < 3 ? [...initial] : refillCalls === 3 ? [...initial, ...discovered] : []
+    refill: async () => ({ items: ++refillCalls < 3 ? [...initial] : refillCalls === 3 ? [...initial, ...discovered] : [], skipped: [] })
   })).start();
 
   const deadline = Date.now() + 2000;
@@ -73,7 +73,7 @@ test('refills the queue while a slow file is still processing', async t => {
   assert.equal(job.items.find(item => item.unitId === 0)?.stage, 'convert');
   releaseSlow(); await job.completion;
   assert.equal(job.snapshot().success, 6);
-  assert.equal(job.snapshot().mediaDateFrom, '2021-01-01T00:00:00.000Z');
+  assert.equal(job.snapshot().mediaDateFrom, '2020-01-01T00:00:00.000Z');
   assert.equal(job.snapshot().mediaDateTo, '2021-02-01T00:00:00.000Z');
   assert.ok(refillCalls >= 4);
 });
@@ -88,4 +88,55 @@ test('aborting a semaphore waiter does not consume a slot', async () => {
   const sem = new Semaphore(1), release = await sem.acquire();
   const controller = new AbortController(), waiting = sem.acquire(controller.signal); controller.abort(); await assert.rejects(waiting); release();
   const again = await sem.acquire(); again();
+});
+
+test('date window uses the last 100 fetched identities before scheduling', async t => {
+  const dir = await folder(t);
+  for (const count of [1, 37, 100, 120]) {
+    const input = items(count).map((item, index) => ({ ...item, size: count - index,
+      takenAt: new Date(Date.UTC(2020, 0, index + 1)).toISOString() }));
+    const job = new ConversionJob('both', [...input, input[0]], defaults, dir, dependencies());
+    const snapshot = job.snapshot();
+    assert.equal(snapshot.mediaDateWindowCount, Math.min(count, 100));
+    assert.equal(snapshot.mediaDateKnownCount, Math.min(count, 100));
+    assert.equal(snapshot.mediaDateFrom, input[Math.max(0, count - 100)].takenAt);
+    assert.equal(snapshot.mediaDateTo, input.at(-1)!.takenAt);
+  }
+});
+
+test('date window carries across overlapping refills and counts missing dates', async t => {
+  const dir = await folder(t);
+  const input = items(112).map((item, index) => ({ ...item, space: index % 2 ? 'shared' as const : 'personal' as const,
+    key: `${index % 2 ? 'shared' : 'personal'}:${index}:${item.component}`,
+    takenAt: new Date(Date.UTC(2020, 0, index + 1)).toISOString() }));
+  let calls = 0;
+  const job = new ConversionJob('both', input.slice(0, 110), defaults, dir, dependencies({
+    refill: async () => ({ items: ++calls === 1 ? [input[0], ...input.slice(110)] : [], skipped: [] })
+  })).start();
+  await job.completion;
+  assert.equal(job.snapshot().total, 112);
+  assert.equal(job.snapshot().mediaDateFrom, input[12].takenAt);
+  assert.equal(job.snapshot().mediaDateTo, input[111].takenAt);
+  const unknown = new ConversionJob('personal', items(2).map((item, i) => ({ ...item, takenAt: i ? 'invalid' : undefined })), defaults, dir, dependencies());
+  assert.equal(unknown.snapshot().mediaDateWindowCount, 2);
+  assert.equal(unknown.snapshot().mediaDateKnownCount, 0);
+  assert.equal(unknown.snapshot().mediaDateFrom, undefined);
+  const oneDay = new ConversionJob('personal', items(2).map(item => ({ ...item, takenAt: '2021-01-01T00:00:00Z' })), defaults, dir, dependencies());
+  assert.equal(oneDay.snapshot().mediaDateFrom, oneDay.snapshot().mediaDateTo);
+});
+
+test('skipped components warn without entering the pipeline and retry resets transient state', async t => {
+  const dir = await folder(t), item = items(1)[0];
+  const skipped = { key: 'personal:2:live_video', space: 'personal' as const, unitId: 2, filename: 'live.mov', reason: 'Unverified Live Photo component' };
+  const job = new ConversionJob('personal', [item], defaults, dir, dependencies({
+    refill: async () => ({ items: [], skipped: [skipped, skipped] })
+  }), [skipped]).start();
+  await job.completion;
+  assert.equal(job.snapshot().success, 1); assert.equal(job.snapshot().total, 1);
+  assert.equal(job.snapshot().skipped, 1); assert.equal(job.snapshot().warnings!.length, 1);
+  assert.equal(job.status, 'completed_with_errors');
+  const retryInput = { ...item, stage: 'failed' as const, error: 'Old failure', backend: 'old backend', percent: 80 };
+  const retry = new ConversionJob('personal', [retryInput], defaults, dir, dependencies());
+  assert.equal(retry.items[0].error, undefined); assert.equal(retry.items[0].backend, undefined);
+  assert.equal(retry.items[0].percent, null); assert.equal(retry.snapshot().mediaDateWindowCount, 1);
 });

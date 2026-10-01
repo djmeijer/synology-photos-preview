@@ -12,6 +12,18 @@ export interface MediaItem {
   size?: number;
   takenAt?: string;
 }
+export const mediaDateWindowLimit = 100;
+export interface SkippedMedia {
+  key: string;
+  space: Space;
+  unitId: number;
+  filename: string;
+  reason: string;
+}
+export interface ConversionBatch {
+  items: MediaItem[];
+  skipped: SkippedMedia[];
+}
 export interface Settings {
   nasUrl: string;
   username: string;
@@ -70,6 +82,10 @@ export interface JobSnapshot {
   mibPerSecond: number;
   mediaDateFrom?: string;
   mediaDateTo?: string;
+  mediaDateWindowCount?: number;
+  mediaDateKnownCount?: number;
+  skipped?: number;
+  warnings?: string[];
   active: ItemProgress[];
   errors: ItemProgress[];
   verificationError?: string;

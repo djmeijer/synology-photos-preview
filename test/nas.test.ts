@@ -14,7 +14,7 @@ test('fetches one batch without requiring totals, offsets or pagination', async 
     calls++;
     if (api.endsWith('Browse.Item')) {
       assert.equal(method, 'get');
-      assert.deepEqual(JSON.parse(params!.id), Array.from({ length: 217 }, (_, i) => i));
+      assert.deepEqual(JSON.parse(params!.id), Array.from({ length: 100 }, (_, i) => i + 117));
       return { list: Array.from({ length: 217 }, (_, i) => ({ id: i, time: 1_609_459_200 + i * 86_400 })) };
     }
     assert.equal(api, 'SYNO.Foto.Upload.ConvertedFile');
@@ -23,14 +23,15 @@ test('fetches one batch without requiring totals, offsets or pagination', async 
     return { list: Array.from({ length: 217 }, (_, i) => raw(i)) };
   }, 'personal');
   assert.equal(calls, 2);
-  assert.equal(items.length, 217);
-  assert.equal(items[0].takenAt, '2021-01-01T00:00:00.000Z');
-  assert.equal(items.at(-1)?.takenAt, '2021-08-05T00:00:00.000Z');
+  assert.equal(items.items.length, 217);
+  assert.equal(items.items[0].takenAt, undefined);
+  assert.equal(items.items[117].takenAt, '2021-04-28T00:00:00.000Z');
+  assert.equal(items.items.at(-1)?.takenAt, '2021-08-05T00:00:00.000Z');
 });
 test('deduplicates batch identities and filters completed work', async () => {
   const items = await fetchConversionBatch(async () => ({ list: [raw(1), raw(1), { ...raw(2), need_thumbnail: false }, raw(3, 1)] }), 'shared');
-  assert.deepEqual(items.map(item => item.key), ['shared:1:photo', 'shared:3:video']);
-  assert.deepEqual(await fetchConversionBatch(async () => ({ list: [] }), 'personal'), []);
+  assert.deepEqual(items.items.map(item => item.key), ['shared:1:photo', 'shared:3:video']);
+  assert.deepEqual(await fetchConversionBatch(async () => ({ list: [] }), 'personal'), { items: [], skipped: [] });
 });
 test('rejects malformed batches and unsupported media and respects cancellation', async () => {
   await assert.rejects(fetchConversionBatch(async () => ({}), 'personal'), /unsupported/);
@@ -39,7 +40,7 @@ test('rejects malformed batches and unsupported media and respects cancellation'
   await assert.rejects(fetchConversionBatch(async () => { calls++; return { list: [] }; }, 'personal', controller.signal));
   assert.equal(calls, 0);
   assert.throws(() => normalizeItem(raw(1, 2), 'personal'), /Unsupported/);
-  assert.throws(() => normalizeItem(raw(1, 'live_video'), 'personal'), /Live Photo/);
+  assert.equal(normalizeItem(raw(1, 'live_video'), 'personal').component, 'live_video');
 });
 test('same unit ID stays distinct by space and component', () => {
   assert.notEqual(normalizeItem(raw(1), 'personal').key, normalizeItem(raw(1), 'shared').key);
@@ -92,4 +93,38 @@ test('API upload acknowledgment is required and missing Shared APIs are explicit
   const output = path.join(directory, 'preview.jpg'); await writeFile(output, 'jpeg');
   await assert.rejects(client.upload(normalizeItem(raw(1), 'personal'), { thumb_sm: output }, new AbortController().signal, () => {}), /access denied/);
   await client.logout();
+});
+
+test('skips only recognized Live Photo components and deduplicates their identities', async () => {
+  const result = await fetchConversionBatch(async () => ({ list: [
+    { ...raw(1), time: 1_609_459_200 }, raw(2, 'live_video'), raw(2, 'live_video'),
+    { ...raw(3, 1), time: 1_609_459_200 }
+  ] }), 'personal');
+  assert.deepEqual(result.items.map(item => item.unitId), [1, 3]);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0].key, 'personal:2:live_video');
+  const unsupported = await fetchConversionBatch(async () => ({ list: [raw(2, 'live_video')] }), 'personal');
+  assert.equal(unsupported.items.length, 0); assert.equal(unsupported.skipped.length, 1);
+  await assert.rejects(fetchConversionBatch(async () => ({ list: [raw(2, 'live_video'), raw(3, 99)] }), 'personal'), /Unsupported/);
+});
+
+test('invalid IDs cannot become another library item', () => {
+  for (const unit_id of [null, undefined, '', ' ', true, false, [], {}, -1, 1.5, Infinity, '1e2']) {
+    assert.throws(() => normalizeItem({ ...raw(1), unit_id }, 'personal'), /unrecognized/);
+  }
+  assert.equal(normalizeItem({ ...raw(1), unit_id: '0' }, 'personal').unitId, 0);
+});
+
+test('known work is excluded before date lookup and optional lookup honors cancellation', async () => {
+  const known = new Set(['personal:1:photo']);
+  const result = await fetchConversionBatch(async (api, _method, params) => {
+    if (!api.endsWith('Browse.Item')) return { list: [raw(1), raw(2)] };
+    assert.deepEqual(JSON.parse(params!.id), [2]); throw new Error('Optional lookup unavailable');
+  }, 'personal', undefined, known);
+  assert.deepEqual(result.items.map(item => item.unitId), [2]);
+  const controller = new AbortController();
+  await assert.rejects(fetchConversionBatch(async api => {
+    if (!api.endsWith('Browse.Item')) return { list: [raw(2)] };
+    controller.abort(); throw controller.signal.reason;
+  }, 'personal', controller.signal), { name: 'AbortError' });
 });
