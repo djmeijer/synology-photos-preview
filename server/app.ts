@@ -107,12 +107,9 @@ export class Studio extends EventEmitter {
     return spaces;
   }
   private async fetchBatch(library: Library, signal?: AbortSignal, knownKeys?: ReadonlySet<string>): Promise<ConversionBatch> {
-    const batch: ConversionBatch = { items: [], skipped: [] };
-    for (const space of this.validateLibrary(library)) {
-      const result = await fetchConversionBatch(this.nas!.request, space, signal, knownKeys);
-      batch.items.push(...result.items); batch.skipped.push(...result.skipped);
-    }
-    return batch;
+    const spaces = this.validateLibrary(library);
+    const results = await Promise.all(spaces.map(space => fetchConversionBatch(this.nas!.request, space, signal, knownKeys)));
+    return { items: results.flatMap(result => result.items), skipped: results.flatMap(result => result.skipped) };
   }
   async start(input: unknown) {
     const options = validateJobInput(input);

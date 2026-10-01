@@ -87,13 +87,16 @@ export class MediaConverter {
   }
   private async thumbnails(source: string, directory: string, signal: AbortSignal): Promise<Record<string, string>> {
     const outputs = Object.fromEntries(['sm', 'm', 'xl'].map(size => [`thumb_${size}`, path.join(directory, `thumb_${size}.jpg`)]));
-    const args = [`${source}[0]`, '-auto-orient', '-colorspace', 'sRGB', '-strip', '-background', 'white', '-alpha', 'remove', '-alpha', 'off', '-write', 'mpr:original'];
-    for (const [key, size] of [['thumb_sm', 240], ['thumb_m', 320], ['thumb_xl', 1280]] as const) {
-      args.push('(', 'mpr:original', '-resize', `${size}x${size}^>`, '-quality', '90', '-write', outputs[key], '+delete', ')');
-    }
-    // Decode once into ImageMagick's memory register; all three outputs reuse it.
+    const args = [`${source}[0]`, '-auto-orient', '-colorspace', 'sRGB', '-strip', '-background', 'white', '-alpha', 'remove', '-alpha', 'off',
+      // Build a thumbnail pyramid. The expensive full-resolution resize happens
+      // once; the 320px and 240px files are derived from the 1280px result.
+      '-thumbnail', '1280x1280^>', '-write', 'mpr:xl', '-quality', '90', '-write', outputs.thumb_xl,
+      '(', 'mpr:xl', '-thumbnail', '320x320^>', '-write', 'mpr:m', '-quality', '90', '-write', outputs.thumb_m, '+delete', ')',
+      '(', 'mpr:m', '-thumbnail', '240x240^>', '-quality', '90', '-write', outputs.thumb_sm, '+delete', ')'];
     args.push('null:');
-    await command(this.settings.magick, args, { signal, env: { ...imageCacheEnvironment, MAGICK_TEMPORARY_PATH: directory } });
+    await command(this.settings.magick, args, { signal, env: {
+      ...imageCacheEnvironment(this.hardware.memoryGiB, this.settings.images), MAGICK_TEMPORARY_PATH: directory
+    } });
     return outputs;
   }
   async convert(item: MediaItem, source: string, directory: string, signal: AbortSignal, report: (percent: number | null, backend: string) => void) {

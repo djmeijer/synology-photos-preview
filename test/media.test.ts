@@ -6,6 +6,7 @@ import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
 import { parseVideoInfo, videoArgs, videoDimensions, softwareFilters, inspectHardware, MediaConverter } from '../server/media.ts';
 import { defaults } from '../server/settings.ts';
 import { command } from '../server/process.ts';
+import { imageCacheEnvironment } from '../server/image-resources.ts';
 import { localSettings } from '../scripts/tools.ts';
 import { fixtures } from '../scripts/fixtures.ts';
 import type { MediaItem } from '../shared/types.ts';
@@ -75,8 +76,14 @@ test('benchmark fixtures generate only their two inputs with network access disa
   finally { globalThis.fetch = original; }
   assert.deepEqual((await readdir(directory)).sort(), ['photo.png', 'video.mp4']);
 });
+test('image cache memory scales with hardware while preserving system headroom', () => {
+  assert.equal(imageCacheEnvironment(128, 32).MAGICK_MEMORY_LIMIT, '992MiB');
+  assert.equal(imageCacheEnvironment(32, 16).MAGICK_MEMORY_LIMIT, '448MiB');
+  assert.equal(imageCacheEnvironment(8, 32).MAGICK_MEMORY_LIMIT, '256MiB');
+  assert.equal(imageCacheEnvironment(512, 1).MAGICK_MEMORY_LIMIT, '1024MiB');
+});
 
-test('48-megapixel RGB photos spill to disk and generate all three thumbnails', { skip: process.env.MEDIA_TESTS !== '1', timeout: 120_000 }, async t => {
+test('48-megapixel RGB photos generate all three thumbnails', { skip: process.env.MEDIA_TESTS !== '1', timeout: 120_000 }, async t => {
   const settings = await localSettings(), hardware = await inspectHardware(settings);
   const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-large-photo-test-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

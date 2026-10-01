@@ -189,7 +189,7 @@ The runtime connects to the configured NAS. The default benchmark uses generated
 
 ### ImageMagick reports `cache resources exhausted`
 
-Large photos can exceed ImageMagick's 256 MiB memory cache and require temporary disk caching. The app allows up to 1 GiB of disk cache per thumbnail conversion, including memory-mapped files, and includes that allowance in its staged-storage reservation. Older versions capped disk caching at 64 MiB, which could fail on high-resolution HEIC photos even with free RAM and disk space.
+Large photos can exceed ImageMagick's memory cache and require much slower temporary disk caching. The app now gives each image worker a safe share of installed RAM, while reserving half of usable memory for the rest of the pipeline and capping each ImageMagick memory resource at 1 GiB. It also allows up to 1 GiB of disk cache per thumbnail conversion, including memory-mapped files, and includes that allowance in its staged-storage reservation. Older versions fixed every worker's memory and map caches at 256 MiB and capped disk caching at 64 MiB, which could make high-resolution photos very slow or fail even with free RAM and disk space.
 
 Restart the server after updating, then retry failed items. If the error persists, ensure the temporary drive has free space and reduce **Image workers** to reduce simultaneous memory use. Exceptionally large images or a stricter ImageMagick `policy.xml` may still exceed the cache limits.
 
