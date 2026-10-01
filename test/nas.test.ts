@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mockNas } from './mock-nas.ts';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fetchConversionBatch, NasClient, normalizeItem, normalizeUrl, retry } from '../server/nas.ts';
-import { NasError } from '../server/errors.ts';
+import { DownloadReservationError, NasError } from '../server/errors.ts';
 
 const raw = (id: number, type: number | string = 0) => ({ unit_id: id, filename: `media-${id}.heic`, type, need_thumbnail: true, need_video: type === 1 });
 test('fetches one batch without requiring totals, offsets or pagination', async () => {
@@ -90,6 +90,38 @@ test('streams downloads and multipart uploads using distinct Personal and Shared
   assert.equal(JSON.stringify(client.connection).includes('secret'), false);
   await client.logout();
 });
+test('oversized Content-Length requests a larger reservation before writing original media', async t => {
+  const { client, requests } = await mockNas(t); await client.login('secret');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-download-size-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'source.jpg'), progress: number[] = [];
+  await assert.rejects(client.download(normalizeItem(raw(1), 'personal'), source, new AbortController().signal, 8, (_percent, bytes = 0) => progress.push(bytes)), (error: unknown) => {
+    assert.ok(error instanceof DownloadReservationError);
+    assert.equal(error.sourceBytes, 14); assert.equal(error.estimated, false); return true;
+  });
+  assert.deepEqual(await readdir(directory), []);
+  assert.deepEqual(progress, [0]);
+  assert.equal(requests.filter(request => request.method === 'download').length, 1);
+  await client.logout();
+});
+
+test('chunked oversized downloads stop within the allowance and request a growing estimate', async t => {
+  const { client, requests } = await mockNas(t, { chunkedDownload: true }); await client.login('secret');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-chunked-size-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'source.jpg');
+  await assert.rejects(client.download(normalizeItem(raw(1), 'personal'), source, new AbortController().signal, 8, () => {}), (error: unknown) => {
+    assert.ok(error instanceof DownloadReservationError);
+    assert.equal(error.sourceBytes, 14); assert.equal(error.estimated, true); return true;
+  });
+  assert.ok((await stat(source)).size <= 8);
+  assert.equal(requests.filter(request => request.method === 'download').length, 1);
+  // The same original can be downloaded after acquiring the larger allowance.
+  await client.download(normalizeItem(raw(1), 'personal'), source, new AbortController().signal, 16, () => {});
+  assert.equal(await readFile(source, 'utf8'), 'original-bytes');
+  await client.logout();
+});
+
 test('API upload acknowledgment is required and missing Shared APIs are explicit', async t => {
   const { client } = await mockNas(t, { rejectUpload: true, advertisedShared: false }); await client.login('secret');
   assert.deepEqual(client.connection.spaces, ['personal']); assert.match(client.connection.sharedReason!, /Shared/);

@@ -6,7 +6,7 @@ import { rm } from 'node:fs/promises';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { AppError, NasError } from './errors.ts';
+import { AppError, DownloadReservationError, NasError } from './errors.ts';
 import { mediaDateLookupBatchSize, type Connection, type ConversionBatch, type MediaItem, type SkippedMedia, type Space } from '../shared/types.ts';
 
 type ApiInfo = { path: string; minVersion: number; maxVersion: number };
@@ -172,11 +172,16 @@ export class NasClient {
         response.data.destroy();
         throw new AppError('NAS returned an API error instead of original media. Reconnect and check download permissions.', 409);
       }
-      const length = Number(response.headers['content-length']);
+      const rawLength = Number(response.headers['content-length']);
+      const length = Number.isSafeInteger(rawLength) && rawLength > 0 ? rawLength : 0;
+      if (length > maxBytes) {
+        response.data.destroy();
+        throw new DownloadReservationError(length);
+      }
       let bytes = 0;
       const counter = new Transform({ transform(chunk, _encoding, done) {
         bytes += chunk.length;
-        if (bytes > maxBytes) return done(new AppError('Media exceeds its temporary-disk reservation. Increase max staged storage or reduce download concurrency.', 409));
+        if (bytes > maxBytes) return done(new DownloadReservationError(bytes, true));
         progress(length > 0 ? Math.min(100, bytes / length * 100) : null, bytes);
         done(null, chunk);
       } });

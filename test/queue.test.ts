@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ConversionJob, DiskBudget, type JobDependencies, Semaphore } from '../server/queue.ts';
 import { defaults } from '../server/settings.ts';
-import { AppError } from '../server/errors.ts';
+import { AppError, DownloadReservationError } from '../server/errors.ts';
 import type { MediaItem } from '../shared/types.ts';
 const items = (count: number): MediaItem[] => Array.from({ length: count }, (_, i) => ({ key: `personal:${i}:${i % 2 ? 'video' : 'photo'}`, space: 'personal', unitId: i, filename: `../file-${i}.jpg`, component: i % 2 ? 'video' : 'photo', needThumbnail: true, needVideo: !!(i % 2) }));
 async function folder(t: test.TestContext) { const dir = await mkdtemp(path.join(os.tmpdir(), 'desktop-queue-test-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir; }
@@ -100,6 +100,74 @@ test('insufficient temporary disk space without admitted work fails immediately'
   const dir = await folder(t), signal = new AbortController().signal;
   const budget = new DiskBudget({ ...defaults, maxStagedGiB: 1, downloads: 1, diskReserveGiB: Number.MAX_SAFE_INTEGER }, dir);
   await assert.rejects(budget.acquire({ ...items(2)[1], needThumbnail: false }, signal), /Insufficient free temporary storage/);
+});
+
+test('concurrent oversized downloads release their estimates before retrying without duplicate conversions', { timeout: 10_000 }, async t => {
+  const dir = await folder(t), base = dependencies();
+  t.mock.method(os, 'freemem', () => 8 * 1024 ** 3);
+  const input = [1, 3].map(unitId => ({ ...items(4)[unitId], needThumbnail: false }));
+  const attempts = new Map<number, number>();
+  const discarded = new Map<number, string>();
+  let conversions = 0, uploads = 0;
+  const sourceBytes = 300 * 1024 ** 2;
+  const job = new ConversionJob('personal', input, { ...defaults, maxStagedGiB: 1, diskReserveGiB: 1, downloads: 2, videos: 2 }, dir, dependencies({
+    reserve: undefined,
+    download: async (...args) => {
+      const [item, source, , maxBytes] = args;
+      attempts.set(item.unitId, (attempts.get(item.unitId) ?? 0) + 1);
+      if (maxBytes < sourceBytes) {
+        await writeFile(source, 'partial download'); discarded.set(item.unitId, path.dirname(source));
+        throw new DownloadReservationError(sourceBytes);
+      }
+      assert.equal(item.size, sourceBytes);
+      await assert.rejects(readdir(discarded.get(item.unitId)!), { code: 'ENOENT' });
+      await base.download(...args);
+    },
+    convert: async (...args) => { conversions++; return base.convert(...args); },
+    upload: async (...args) => { uploads++; return base.upload(...args); }
+  })).start();
+  t.after(() => job.stop());
+  await job.completion;
+  assert.equal(job.status, 'completed'); assert.equal(job.snapshot().total, 2);
+  assert.equal(job.snapshot().success, 2); assert.equal(job.snapshot().failed, 0);
+  assert.deepEqual([...attempts.values()], [2, 2]);
+  assert.equal(conversions, 2); assert.equal(uploads, 2);
+  assert.deepEqual(await readdir(dir), []);
+});
+
+test('chunked size estimates grow without rejecting an original that fits the total budget', async t => {
+  const dir = await folder(t), base = dependencies();
+  t.mock.method(os, 'freemem', () => 8 * 1024 ** 3);
+  let downloads = 0;
+  const sourceBytes = 400 * 1024 ** 2;
+  const job = new ConversionJob('personal', [{ ...items(2)[1], needThumbnail: false }], { ...defaults, maxStagedGiB: 1, diskReserveGiB: 1, downloads: 16 }, dir, dependencies({
+    reserve: undefined,
+    download: async (...args) => {
+      downloads++;
+      if (args[3] < sourceBytes) throw new DownloadReservationError(sourceBytes, true);
+      return base.download(...args);
+    }
+  })).start();
+  await job.completion;
+  assert.equal(job.status, 'completed'); assert.equal(job.snapshot().success, 1);
+  assert.equal(downloads, 2); assert.equal(job.items[0].size, 448 * 1024 ** 2);
+  assert.deepEqual(await readdir(dir), []);
+});
+
+test('a discovered original too large for the total staged budget fails without repeated downloads', async t => {
+  const dir = await folder(t);
+  t.mock.method(os, 'freemem', () => 8 * 1024 ** 3);
+  let downloads = 0, conversions = 0;
+  const job = new ConversionJob('personal', [{ ...items(2)[1], needThumbnail: false }], { ...defaults, maxStagedGiB: 1, diskReserveGiB: 1, downloads: 2 }, dir, dependencies({
+    reserve: undefined,
+    download: async () => { downloads++; throw new DownloadReservationError(2 * 1024 ** 3); },
+    convert: async () => { conversions++; return {}; }
+  })).start();
+  await job.completion;
+  assert.equal(job.snapshot().total, 1); assert.equal(job.snapshot().failed, 1);
+  assert.match(job.failedItems()[0].error!, /File exceeds the staged-storage budget/);
+  assert.equal(downloads, 1); assert.equal(conversions, 0);
+  assert.deepEqual(await readdir(dir), []);
 });
 
 test('independent stage limits, duplicate prevention, cleanup, transfer progress and success acknowledgments', async t => {

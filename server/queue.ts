@@ -4,7 +4,7 @@ import { mkdtemp, rm, statfs, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { AppError, errorMessage } from './errors.ts';
+import { AppError, DownloadReservationError, errorMessage } from './errors.ts';
 import { imageCacheDiskBytes } from './image-resources.ts';
 import type { ConversionBatch, ItemProgress, JobSnapshot, Library, MediaItem, Settings, SkippedMedia } from '../shared/types.ts';
 import { mediaDateRange } from '../shared/media-dates.ts';
@@ -104,6 +104,7 @@ export class ConversionJob extends EventEmitter {
   private sourceDone = false;
   private processing = 0;
   private next = 0;
+  private retries: ItemProgress[] = [];
   private refill: Promise<void> | null = null;
   private nextRefillAt = 0;
   private idleChecks = 0;
@@ -165,6 +166,8 @@ export class ConversionJob extends EventEmitter {
   private async takeNext(): Promise<ItemProgress | null> {
     while (true) {
       await this.gate();
+      const retry = this.retries.shift();
+      if (retry) { this.processing++; return retry; }
       if (this.next < this.items.length) {
         this.processing++;
         return this.items[this.next++];
@@ -238,6 +241,7 @@ export class ConversionJob extends EventEmitter {
         try { item = await this.takeNext(); } catch { break; }
         if (!item) break;
         let itemDirectory: string | undefined, release: (() => void) | undefined, retain: (() => void) | undefined;
+        let retryDownload = false;
         try {
           const signal = this.controller.signal;
           item.stage = 'waiting'; this.notify(true);
@@ -281,6 +285,16 @@ export class ConversionJob extends EventEmitter {
           }));
         } catch (error) {
           if (this.controller.signal.aborted) { item.stage = 'cancelled'; item.percent = null; }
+          else if (error instanceof DownloadReservationError && error.sourceBytes > (item.size ?? 0)) {
+            // Release this estimate before requesting the larger reservation.
+            // Growing multiple held reservations in place could deadlock.
+            const minimum = 128 * 1024 ** 2 + (item.component === 'photo' || item.needThumbnail ? imageCacheDiskBytes : 0);
+            const maximumSource = Math.floor((this.settings.maxStagedGiB * 1024 ** 3 - minimum) / 2);
+            item.size = error.estimated
+              ? Math.max(error.sourceBytes, Math.min(maximumSource, error.sourceBytes * 2))
+              : error.sourceBytes;
+            item.percent = null; retryDownload = true;
+          }
           else { item.stage = 'failed'; item.error = errorMessage(error); item.percent = null; }
         } finally {
           let cleaned = true;
@@ -291,6 +305,7 @@ export class ConversionJob extends EventEmitter {
             } catch { cleaned = false; this.addWarning(`Temporary-file cleanup failed for ${item.filename}. Storage remains reserved until run cleanup succeeds.`); }
           }
           if (cleaned) release?.(); else if (release) { retain?.(); this.retainedReservations.push(release); }
+          if (retryDownload) { item.stage = 'queued'; this.retries.push(item); }
           this.processing--; this.resetIdleConfirmation(); this.wakeWork(); this.notify(true);
         }
       }

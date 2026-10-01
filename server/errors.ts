@@ -1,6 +1,11 @@
 export class AppError extends Error {
   constructor(message: string, public status = 400, public code = 'APP_ERROR') { super(message); }
 }
+export class DownloadReservationError extends AppError {
+  constructor(readonly sourceBytes: number, readonly estimated = false) {
+    super('Media exceeds its temporary-disk reservation. Increase max staged storage or reduce download concurrency.', 409);
+  }
+}
 export class NasError extends AppError {
   constructor(public nasCode: number, operation: string) {
     const detail = nasCode === 403 && operation === 'login' ? 'Two-factor authentication code required.'

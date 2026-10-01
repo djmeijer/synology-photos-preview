@@ -171,6 +171,8 @@ When Synology supplies a source size, the application reserves twice that size p
 
 Files waiting for storage reservations stay queued while admitted files finish downloading, converting, uploading, and cleaning up, even when those stages take longer than two minutes. Increasing the staged limit also increases each unknown-size file's reservation, so it does not by itself increase their concurrency. If no admitted files remain and available memory stays at or below 1 GiB for two minutes, waiting files fail with a memory-specific error.
 
+If a download reveals that the original is larger than its estimated allowance, the app cleans up the attempt, releases its reservation, and automatically queues the same file with a larger reservation. A download's Content-Length supplies the size before writing oversized media; downloads without that header grow their estimate when they reach the allowance. The total staged budget and minimum free disk space still apply, so larger files can reduce concurrency. Files too large for the total staged budget fail with a storage-budget error.
+
 If temporary cleanup fails, the affected filename appears in run warnings and its storage reservation remains held until final run cleanup succeeds. Once no admitted files can release storage, files blocked by these retained reservations fail with a cleanup-specific error so the run can finish and attempt final cleanup. Cleanup warnings do not undo acknowledged uploads. If final cleanup fails too, remove the leftover run directory after stopping the server and resolving any file locks.
 
 If you see:
