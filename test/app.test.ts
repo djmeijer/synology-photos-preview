@@ -1,0 +1,114 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { once } from 'node:events';
+import { Studio, createApp } from '../server/app.ts';
+import { mockNas } from './mock-nas.ts';
+import { MediaConverter } from '../server/media.ts';
+import { command } from '../server/process.ts';
+import { validateSettings, writeJson } from '../server/settings.ts';
+import { AppError } from '../server/errors.ts';
+import type { Hardware } from '../shared/types.ts';
+
+const hardware: Hardware = { cpu: 'test', logicalCpus: 8, memoryGiB: 32, gpu: null, ffmpeg: true, ffprobe: true, magick: true, heic: true, nvenc: false, cudaScale: false, hdrFilters: true, warnings: [] };
+async function studioFixture(t: test.TestContext) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-app-test-'));
+  const studio = new Studio(directory); studio.hardware = hardware;
+  t.after(async () => { await studio.shutdown(); await rm(directory, { recursive: true, force: true }); });
+  return studio;
+}
+test('local API requires loopback Host and a same-origin CSRF token; SSE supplies the current job on reconnection', async t => {
+  const studio = await studioFixture(t), server = http.createServer();
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port, base = `http://127.0.0.1:${port}`;
+  server.on('request', createApp(studio, port));
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
+  const response = await fetch(`${base}/api/state`), state = await response.json() as any;
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await fetch(`${base}/api/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await fetch(`${base}/api/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Preview-Token': state.csrfToken, Origin: 'https://foreign.example' }, body: '{}' })).status, 403);
+  assert.equal((await fetch(`${base}/api/disconnect`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Preview-Token': state.csrfToken }, body: '{}' })).status, 200);
+  const hostile = await new Promise<number>(resolve => { http.get(`${base}/api/state`, { headers: { Host: 'foreign.example' } }, res => { res.resume(); resolve(res.statusCode!); }); });
+  assert.equal(hostile, 403);
+  for (let i = 0; i < 2; i++) {
+    const controller = new AbortController(), events = await fetch(`${base}/api/events`, { signal: controller.signal });
+    const reader = events.body!.getReader(), data = new TextDecoder().decode((await reader.read()).value);
+    assert.match(data, /data: /); assert.match(data, /"connected":false/); assert.equal(data.includes('csrfToken'), false);
+    controller.abort(); await reader.cancel().catch(() => {});
+  }
+});
+test('direct execution handles unpaginated batches, job conflicts, cleanup and retries without exposing credentials', async t => {
+  const studio = await studioFixture(t), nas = await mockNas(t, { listOnlyQueue: true });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  await assert.rejects(studio.start({ library: 'invalid' as any }), /Invalid library/);
+  // Hold conversion after download so job-control conflicts can be exercised deterministically.
+  const original = MediaConverter.prototype.convert;
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  MediaConverter.prototype.convert = async () => { await hold; throw new AppError('Deliberate conversion failure'); };
+  t.after(() => { MediaConverter.prototype.convert = original; });
+  await studio.start({ library: 'both' });
+  await assert.rejects(studio.start({ library: 'both' }), /current operation/);
+  await assert.rejects(studio.disconnect(), /current operation/);
+  assert.equal(studio.job!.snapshot().total, 2);
+  const batchRequests = nas.requests.filter(r => r.method === 'list_convert_needed');
+  assert.equal(batchRequests.length, 2);
+  assert.deepEqual(batchRequests.map(r => r.api), ['SYNO.Foto.Upload.ConvertedFile', 'SYNO.FotoTeam.Upload.ConvertedFile']);
+  assert.ok(batchRequests.every(r => !r.params.has('offset')));
+  assert.equal(JSON.stringify(studio.state()).includes('secret'), false);
+  release(); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(studio.job!.snapshot().success, 0); assert.equal(studio.job!.snapshot().failed, 2);
+  assert.ok(nas.requests.filter(r => r.method === 'list_convert_needed').length >= 2);
+  assert.equal(studio.history.length, 1);
+  const persisted = (await readFile(path.join(studio.dataDirectory, 'settings.json'), 'utf8')) + (await readFile(path.join(studio.dataDirectory, 'history.json'), 'utf8'));
+  assert.equal(persisted.includes('secret'), false);
+  assert.deepEqual(await readdir(path.join(studio.dataDirectory, 'work')), []);
+  // Retry starts with retained failures and then checks the NAS for additional work.
+  const firstId = studio.job!.id;
+  await studio.start({ retryFailed: true }); await studio.job!.completion;
+  while (studio.finalizing) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.notEqual(studio.job!.id, firstId); assert.equal(studio.job!.snapshot().total, 2);
+});
+test('successful batches continue automatically until the NAS returns no new work', async t => {
+  const studio = await studioFixture(t), nas = await mockNas(t, { queueBatches: [[1], [2], []] });
+  await studio.connect({ url: nas.url, username: 'test-user', password: 'secret' });
+  const original = MediaConverter.prototype.convert;
+  MediaConverter.prototype.convert = async (_item, _source, directory) => {
+    const output = path.join(directory, 'preview.jpg'); await writeFile(output, 'preview'); return { thumb_sm: output };
+  };
+  t.after(() => { MediaConverter.prototype.convert = original; });
+
+  await studio.start({ library: 'personal' });
+  const deadline = Date.now() + 5000;
+  while (nas.requests.filter(request => request.method === 'list_convert_needed').length < 3 || studio.job?.active || studio.finalizing) {
+    if (Date.now() > deadline) assert.fail('Automatic batch processing did not finish');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  assert.ok(nas.requests.filter(request => request.method === 'list_convert_needed').length >= 3);
+  assert.equal(nas.requests.filter(request => request.method === 'upload').length, 2);
+  assert.equal(studio.job!.snapshot().status, 'completed');
+  assert.deepEqual(studio.job!.items.map(item => item.unitId), [1, 2]);
+  assert.equal(studio.history.filter(run => run.status === 'completed').length, 1);
+});
+test('restart requires login and preserves an interrupted summary without session tokens', async t => {
+  const studio = await studioFixture(t);
+  await writeJson(path.join(studio.dataDirectory, 'history.json'), [{ id: 'old', library: 'both', status: 'running', startedAt: new Date().toISOString(), total: 10, success: 4, failed: 1, cancelled: 0, remaining: 5, active: [], errors: [] }]);
+  // Tools may be absent; initialization still succeeds and reports readiness warnings.
+  await studio.initialize();
+  assert.equal(studio.nas, null); assert.equal(studio.job, null);
+  assert.equal(studio.history[0].status, 'stopped'); assert.equal(studio.history[0].success, 4); assert.equal(studio.history[0].cancelled, 5);
+  assert.match(studio.history[0].verificationError!, /restarted/);
+});
+test('settings reject credentials, prototype keys and invalid bounds; subprocess cancellation waits for exit', async () => {
+  assert.throws(() => validateSettings({ password: 'secret' }), /Unknown setting/);
+  assert.throws(() => validateSettings(JSON.parse('{"__proto__":{}}')), /Unknown setting/);
+  assert.throws(() => validateSettings({ videos: 9 }), /Invalid/);
+  const controller = new AbortController();
+  const running = command(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { signal: controller.signal });
+  setTimeout(() => controller.abort(), 50); await assert.rejects(running, /cancelled/);
+});
