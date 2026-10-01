@@ -12,13 +12,11 @@ if not exist node_modules\tsx (
   pause
   exit /b 1
 )
-if not exist dist\index.html (
-  call npm run build
-  if errorlevel 1 (
-    pause
-    exit /b 1
-  )
+call npm run build
+if errorlevel 1 (
+  pause
+  exit /b 1
 )
-echo Open http://127.0.0.1:4177 in your browser after the server starts.
+echo Open the address printed by the server in your browser after it starts.
 call npm start
 pause

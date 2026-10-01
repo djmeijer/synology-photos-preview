@@ -3,7 +3,7 @@ import { access, mkdir, writeFile } from 'node:fs/promises';
 import { command } from '../server/process.ts';
 import type { Settings } from '../shared/types.ts';
 
-export async function fixtures(settings: Settings, directory = path.resolve('.test-data/media')) {
+export async function fixtures(settings: Settings, directory = path.resolve('.test-data/media'), suite: 'integration' | 'benchmark' = 'integration') {
   await mkdir(directory, { recursive: true });
   const file = (name: string) => path.join(directory, name);
   async function create(name: string, executable: string, args: string[]) {
@@ -13,6 +13,7 @@ export async function fixtures(settings: Settings, directory = path.resolve('.te
   const common = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-threads', '2', '-filter_threads', '2'];
   const video = ['-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=30'];
   await create('video.mp4', settings.ffmpeg, [...common, ...video, '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '6', '-c:v', 'libx264', '-threads', '2', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', file('video.mp4')]);
+  if (suite === 'benchmark') return { directory, file };
   await create('rotated.mp4', settings.ffmpeg, [...common, '-display_rotation:v:0', '90', '-i', file('video.mp4'), '-c', 'copy', file('rotated.mp4')]);
   await create('silent.mp4', settings.ffmpeg, [...common, '-i', file('video.mp4'), '-c:v', 'copy', '-an', file('silent.mp4')]);
   await create('hevc10.mp4', settings.ffmpeg, [...common, ...video, '-t', '2', '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params', 'pools=2:frame-threads=1:log-level=error', '-pix_fmt', 'yuv420p10le', file('hevc10.mp4')]);

@@ -10,6 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
+    "pretest:browser": "npm run build",
     "test:browser": "playwright test",
     "benchmark": "tsx scripts/benchmark.ts"
   },

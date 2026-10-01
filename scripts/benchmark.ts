@@ -10,7 +10,7 @@ import type { MediaItem } from '../shared/types.ts';
 
 const settings = await localSettings(), hardware = await inspectHardware(settings);
 if (!hardware.ffmpeg || !hardware.ffprobe || !hardware.magick) throw new Error('Configure FFmpeg, FFprobe and ImageMagick before benchmarking.');
-const samples = process.argv[2] ? null : await fixtures(settings);
+const samples = process.argv[2] ? null : await fixtures(settings, undefined, 'benchmark');
 const inputs = samples ? [samples.file('photo.png'), samples.file('video.mp4')] : (await readdir(path.resolve(process.argv[2]))).map(name => path.resolve(process.argv[2], name));
 const photos = inputs.filter(p => /\.(heic|heif|jpg|jpeg|png|tif|webp)$/i.test(p)), videos = inputs.filter(p => /\.(mp4|mov|mkv|avi|m4v|mts)$/i.test(p));
 if (!photos.length || !videos.length) throw new Error('Benchmark folder must contain both photos and videos.');

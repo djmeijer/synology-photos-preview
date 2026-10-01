@@ -47,13 +47,23 @@ npm start
 
 Open <http://127.0.0.1:4177>.
 
-On Windows, `start.cmd` performs the build when `dist/index.html` is missing and then starts the server:
+On Windows, `start.cmd` builds the interface before starting the server:
 
 ```powershell
 .\start.cmd
 ```
 
-Only one application server should run at a time. Settings changes and application updates take effect on the next run or after restarting the server, depending on the change.
+Only one application server should run at a time. Performance settings apply to the next run. After updating the application, stop the server, run `npm install` and `npm run build`, then restart it; `start.cmd` performs the build step automatically.
+
+`APP_PORT` overrides the default port of 4177. `APP_DATA_DIRECTORY` overrides the default `.data` directory for settings, history, and the default work directory. Set these environment variables before starting the server. For example:
+
+```powershell
+$env:APP_PORT = '4180'
+$env:APP_DATA_DIRECTORY = 'D:\PreviewStudioData'
+npm start
+```
+
+Open the address printed by the server. An explicitly configured **Temporary directory** takes precedence over the work directory under `APP_DATA_DIRECTORY`.
 
 ## Using the application
 
@@ -63,7 +73,7 @@ Only one application server should run at a time. Settings changes and applicati
 4. Click **Execute now**.
 5. Leave the server running until the queue completes, or use **Pause** or **Stop**.
 
-Pause prevents new downloads from starting. Files already admitted to the pipeline can continue through conversion and upload. Stop cancels active work; previews whose uploads were already acknowledged remain on the NAS.
+Pause prevents new downloads from starting, including files waiting for storage. Downloads already started can finish, and downloaded files can continue through conversion and upload. Stop cancels active work; previews whose uploads were already acknowledged remain on the NAS. The selected space is remembered when starting a normal run; unavailable spaces are disabled in the interface.
 
 If the application or computer restarts, unfinished items can be returned by the NAS and processed again. Successfully acknowledged items normally disappear from the NAS work queue.
 
@@ -76,10 +86,17 @@ After a preview upload succeeds, Synology removes that work from its pending set
 - The displayed total grows as new work becomes visible.
 - There is no verified full-backlog number before processing.
 - The application does not use an offset because affected Photos versions repeat items instead of returning a dependable next page.
-- **Current batch dates** shows the date range of the newest group added to the queue. It changes as Synology exposes more work.
+- **Dates of last N loaded files** shows the earliest and latest known media dates among the last 100 unique files fetched from the NAS, or fewer when the run has loaded fewer files. Photos and videos both count. Fetch order determines this window before scheduling changes processing order; repeated items do not move it. The window carries across refills and resets for a new run or retry.
+- Undated files count toward the date window but contribute no date. The interface reports partial date coverage or **Dates unavailable**; a one-day range displays one date. Dates use the browser's local timezone.
 - A slow file can briefly be the only visible item. The application checks again every two seconds and starts newly exposed work without another click.
+- Once all loaded work settles, three fresh checks at two-second intervals must discover no new supported items before the run finishes, taking approximately six seconds plus NAS response time. Newly discovered work resets these checks; pause suspends them and resume restarts them.
+- ETA covers currently discovered work. The NAS may expose more files after uploads finish, so ETA and totals can change during a run.
 
 Items are deduplicated during a run using `space:unitId:component`. Identical filenames can still represent different NAS library items and are therefore processed separately.
+
+An unsupported Live Photo video component is skipped with a warning and remains pending on the NAS. Supported files in the same response continue. Skipped components are counted separately and excluded from the supported-file total. A response containing only unsupported components explains the limitation without starting an empty run.
+
+Runs finish as `completed_with_errors` if files fail, components are skipped, fetching additional work fails, or temporary cleanup/history persistence reports a warning. Successful uploads remain successful. A failure to fetch additional work allows admitted files to finish; connect and execute again to fetch the remaining NAS work. Malformed queue responses and unknown media types remain compatibility errors.
 
 ## Video processing
 
@@ -129,7 +146,7 @@ More video workers do not necessarily improve HDR throughput because several con
 
 ### Benchmarking
 
-Run the included conversion benchmark with generated fixtures:
+Run the included conversion benchmark with a generated PNG and a six-second H.264 video. Fixture generation and conversion run locally without downloading sample media:
 
 ```powershell
 npm run benchmark
@@ -147,7 +164,9 @@ Results are written to `.benchmarks/latest.json`. The benchmark does not change 
 
 Temporary files use `.data/work` unless **Temporary directory** is configured. Each item receives an isolated directory that is deleted after upload, failure, or cancellation.
 
-When Synology supplies a source size, the application reserves approximately twice that size plus 128 MiB. If the size is absent, it divides the staged-storage budget among the configured download workers.
+When Synology supplies a source size, the application reserves approximately twice that size plus 128 MiB. If the size is absent, its reservation is the staged-storage budget divided among the configured download workers, with a minimum of 128 MiB. The staged-storage budget can therefore limit active files below the configured worker counts. Some of each reservation is reserved for overhead; the rest is split between original media and generated previews.
+
+If temporary cleanup fails, the affected filename appears in run warnings and its storage reservation remains held until final run cleanup succeeds. Cleanup warnings do not undo acknowledged uploads. If final cleanup fails too, remove the leftover run directory after stopping the server and resolving any file locks.
 
 If you see:
 
@@ -164,7 +183,7 @@ increase **Staged storage limit**, reduce **Download workers**, or both. Also ma
 - The NAS address, username, preferences, and recent run summaries are stored under `.data`.
 - Original media and generated previews exist temporarily under the configured work directory.
 
-The runtime connects to the configured NAS. Test fixture generation may download the public libheif example image when the optional real-media test suite is enabled.
+The runtime connects to the configured NAS. The default benchmark uses generated local fixtures. The optional real-media integration suite downloads the public libheif example HEIC image if it is not already cached under `.test-data/media`.
 
 ## Troubleshooting
 
@@ -192,13 +211,33 @@ The account needs Shared Space access, and the installed Synology Photos version
 
 ### HTTPS certificate is not trusted
 
-Use a NAS hostname with a certificate trusted by Windows. The application does not disable TLS verification.
+Use a NAS hostname matching a certificate trusted by Node.js. Windows-installed private certificate authorities require Node's system-certificate option. Enable it before starting the application:
 
-### Live Photo video component error
+```powershell
+$env:NODE_OPTIONS = (@($env:NODE_OPTIONS, '--use-system-ca') -join ' ').Trim()
+npm start
+```
 
-Separate `live_video` conversion components are rejected because their download and upload contract has not been verified for all supported Photos versions. Regular photos and videos continue to use their verified routes.
+Alternatively, provide an additional CA certificate file in PEM format:
+
+```powershell
+$env:NODE_EXTRA_CA_CERTS = 'D:\certificates\nas-ca.pem'
+npm start
+```
+
+Restart the server after changing certificate options. The application retains TLS and hostname verification; it never disables certificate checking. See the [Node.js certificate options](https://nodejs.org/download/release/v24.11.1/docs/api/cli.html#--use-system-ca).
+
+### Live Photo video components are skipped
+
+Separate `live_video` conversion components are skipped because their download and upload contract has not been verified. Their count and filenames appear in run warnings. Regular photos and videos in the same batch continue through their verified routes. Skipped components remain pending on the NAS and are not included in **Retry failed**; that action retries supported files that failed.
 
 ## Development
+
+Install the browser used by Playwright once after installing dependencies:
+
+```powershell
+npx playwright install chromium
+```
 
 ```powershell
 npm run check
@@ -207,12 +246,32 @@ npm run test:browser
 npm run build
 ```
 
+`npm run test:browser` builds the interface automatically before starting its isolated test server. Browser tests do not connect to your NAS.
+
+For UI development, first build and start the backend in one terminal:
+
+```powershell
+npm run build
+npm start
+```
+
+Then start Vite in a second terminal and open <http://127.0.0.1:5173>:
+
+```powershell
+npm run dev
+```
+
+The Vite proxy expects the backend at port 4177. Leave `APP_PORT` unset for this development setup; use port overrides with the built interface.
+
 Run the optional real FFmpeg and ImageMagick integration tests from PowerShell with:
 
 ```powershell
 $env:MEDIA_TESTS = '1'
 npm test
+Remove-Item Env:MEDIA_TESTS
 ```
+
+This suite requires configured FFmpeg/ImageMagick tools and HEIC support. Its HEIC example is fetched from libheif's public repository on the first run; the other fixtures are generated locally.
 
 The source layout is:
 

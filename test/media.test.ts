@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
 import { parseVideoInfo, videoArgs, videoDimensions, softwareFilters, inspectHardware, MediaConverter } from '../server/media.ts';
 import { defaults } from '../server/settings.ts';
 import { command } from '../server/process.ts';
@@ -63,4 +63,15 @@ test('real FFmpeg/ImageMagick conversions: HEIC, rotated, HEVC 10-bit, HDR, sile
     });
   }
   await assert.rejects(converter.convert({ key: 'corrupt', unitId: 999, space: 'personal', component: 'video', filename: 'corrupt.mp4', needThumbnail: true, needVideo: true }, samples.file('corrupt.mp4'), directory, new AbortController().signal, () => {}), /failed/);
+});
+
+test('benchmark fixtures generate only their two inputs with network access disabled', { skip: process.env.MEDIA_TESTS !== '1', timeout: 120_000 }, async t => {
+  const settings = await localSettings();
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-offline-fixtures-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('Network access disabled'); };
+  try { await fixtures(settings, directory, 'benchmark'); }
+  finally { globalThis.fetch = original; }
+  assert.deepEqual((await readdir(directory)).sort(), ['photo.png', 'video.mp4']);
 });
