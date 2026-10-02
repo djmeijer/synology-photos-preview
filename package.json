@@ -12,7 +12,8 @@
     "test": "tsx --test test/*.test.ts",
     "pretest:browser": "npm run build",
     "test:browser": "playwright test",
-    "benchmark": "tsx scripts/benchmark.ts"
+    "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:video": "tsx scripts/benchmark-video.ts"
   },
   "dependencies": {
     "axios": "^1.12.2",

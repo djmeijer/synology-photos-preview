@@ -165,6 +165,16 @@ npm run benchmark -- "D:\path\to\media"
 
 Results are written to `.benchmarks/latest.json`. The benchmark does not change application settings.
 
+To compare video decoding and scaling pipelines using real media, pause the application and let admitted downloads, conversions, and uploads finish, then run:
+
+```powershell
+npm run benchmark:video -- "D:\path\to\videos"
+```
+
+This conversion-only benchmark accepts complete, unrotated SDR H.264/HEVC videos. It compares the current CUDA path, CUDA pixel formats and scaling algorithms, extra decoder frames, early frame-rate reduction, CUVID decoder resizing, and CPU decoding with CPU or GPU scaling. It also compares CUDA worker counts and mixed CPU/CUDA decoder pools. Tests retain the current preview dimensions, quality setting, frame-rate cap, and audio settings. Bilinear and decoder-integrated resizing can produce different image detail than the current bicubic scaler.
+
+Each input contributes its first 30 seconds. Single-file measurements use three repetitions; batch measurements use two repetitions with four jobs per input. Results and exact commands are saved in `.benchmarks/video-pipeline/latest.json`. Shortlisted outputs are retained alongside the report and checked for dimensions, codec, frame rate, duration, and complete decoding. No media is uploaded and no application settings are changed. Resume the application when benchmarking finishes.
+
 ## Temporary storage
 
 Temporary files use `.data/work` unless **Temporary directory** is configured. Each item receives an isolated directory that is deleted after upload, failure, or cancellation.
