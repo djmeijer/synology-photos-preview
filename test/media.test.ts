@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
-import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
-import { parseVideoInfo, videoArgs, videoDimensions, softwareFilters, inspectHardware, MediaConverter } from '../server/media.ts';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { parseVideoInfo, videoArgs, videoInputArgs, videoDimensions, softwareFilters, inspectHardware, MediaConverter } from '../server/media.ts';
 import { defaults } from '../server/settings.ts';
 import { command } from '../server/process.ts';
 import { imageCacheEnvironment } from '../server/image-resources.ts';
@@ -76,6 +77,85 @@ test('benchmark fixtures generate only their two inputs with network access disa
   try { await fixtures(settings, directory, 'benchmark'); }
   finally { globalThis.fetch = original; }
   assert.deepEqual((await readdir(directory)).sort(), ['photo.png', 'video.mp4']);
+});
+
+test('reserved color-space metadata is corrected before decoding only on the selected movie stream', () => {
+  const movie = { index: 2, codec_type: 'video', codec_name: 'h264', width: 1920, height: 1080, color_space: 'reserved', color_primaries: 'bt709' };
+  const info = parseVideoInfo({ streams: [
+    { index: 0, codec_type: 'video', width: 300, height: 300, disposition: { attached_pic: 1 } }, movie
+  ] });
+  assert.deepEqual(videoInputArgs('in.mp4', info), ['-bsf:2', 'h264_metadata=matrix_coefficients=1', '-i', 'in.mp4']);
+  for (const mode of ['cuda', 'nvenc', 'software'] as const) {
+    const args = videoArgs('in.mp4', 'out.mp4', info, defaults, mode);
+    assert.ok(args.indexOf('-bsf:2') < args.indexOf('-i'));
+    assert.equal(args[args.indexOf('-bsf:2') + 1], 'h264_metadata=matrix_coefficients=1');
+  }
+  const hdr = parseVideoInfo({ streams: [{ ...movie, codec_name: 'hevc', color_primaries: 'bt2020', color_transfer: 'smpte2084' }] });
+  assert.equal(hdr.hdr, true);
+  assert.equal(hdr.inputBitstreamFilter, 'hevc_metadata=matrix_coefficients=9');
+  assert.equal(parseVideoInfo({ streams: [{ ...movie, color_primaries: undefined }] }).inputBitstreamFilter, 'h264_metadata=matrix_coefficients=2');
+  for (const color_space of ['bt709', 'bt2020nc', 'unknown', undefined]) {
+    assert.deepEqual(videoInputArgs('in.mp4', parseVideoInfo({ streams: [{ ...movie, color_space }] })), ['-i', 'in.mp4']);
+  }
+  assert.equal(parseVideoInfo({ streams: [{ ...movie, codec_name: 'vp9' }] }).inputBitstreamFilter, undefined);
+});
+
+test('real reserved color-space videos generate thumbnails and previews without changing originals or valid color tags', { skip: process.env.MEDIA_TESTS !== '1', timeout: 120_000 }, async t => {
+  const settings = await localSettings(), hardware = await inspectHardware(settings);
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-reserved-color-test-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const probe = async (filename: string) => JSON.parse(await command(settings.ffprobe, ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', filename]));
+  const hash = async (filename: string) => createHash('sha256').update(await readFile(filename)).digest('hex');
+  for (const [codec, range, hdr] of [['h264', 'tv', false], ['h264', 'pc', false], ['hevc', 'tv', true]] as const) {
+    await t.test(`${codec} ${range}${hdr ? ' HDR' : ''}`, async () => {
+      const outputDirectory = await mkdtemp(path.join(directory, 'item-'));
+      const original = path.join(outputDirectory, 'original.mp4'), source = path.join(outputDirectory, 'reserved.mp4');
+      await command(settings.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+        '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '0.3',
+        '-c:v', codec === 'h264' ? 'libx264' : 'libx265', '-threads', '2', '-preset', 'ultrafast',
+        ...(codec === 'hevc' ? ['-x265-params', 'pools=2:frame-threads=1:log-level=error'] : []),
+        '-pix_fmt', hdr ? 'yuv420p10le' : 'yuv420p', '-color_range', range,
+        '-color_primaries', hdr ? 'bt2020' : 'bt709', '-color_trc', hdr ? 'smpte2084' : 'bt709', '-colorspace', hdr ? 'bt2020nc' : 'bt709',
+        '-c:a', 'aac', original]);
+      await command(settings.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-i', original, '-map', '0', '-c', 'copy',
+        '-bsf:v', `${codec}_metadata=matrix_coefficients=3`, source]);
+      const before = await probe(source), digest = await hash(source);
+      assert.equal(before.streams[0].color_space, 'reserved');
+      assert.equal(before.streams[0].color_range, range);
+      // FFmpeg's full-range yuvj formats bypass this metadata validation.
+      if (range === 'tv') await assert.rejects(command(settings.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-i', source, '-frames:v', '1', '-vf', 'scale=160:90', '-f', 'null', '-']), /Invalid color (?:range|space)/);
+      const item: MediaItem = { key: 'reserved', unitId: 1, space: 'personal', component: 'video', filename: 'reserved.mp4', needThumbnail: true, needVideo: true };
+      // Verify the CPU path even on machines with an NVIDIA GPU.
+      const outputs = await new MediaConverter(settings, { ...hardware, nvenc: false }).convert(item, source, outputDirectory, new AbortController().signal, () => {});
+      assert.deepEqual(Object.keys(outputs).sort(), ['film_h264', 'thumb_m', 'thumb_sm', 'thumb_xl']);
+      for (const output of Object.values(outputs)) assert.ok((await stat(output)).size > 0);
+      const result = await probe(outputs.film_h264), video = result.streams.find((s: any) => s.codec_type === 'video');
+      assert.equal(video.codec_name, 'h264');
+      // Compare with a correctly tagged source through the same preview pipeline,
+      // which can convert full-range pixels and change the output color tags.
+      const reference = path.join(outputDirectory, 'reference.mp4');
+      await command(settings.ffmpeg, videoArgs(original, reference, parseVideoInfo(await probe(original)), settings, 'software'));
+      const referenceVideo = (await probe(reference)).streams.find((s: any) => s.codec_type === 'video');
+      for (const tag of ['color_range', 'color_space', 'color_transfer', 'color_primaries']) assert.equal(video[tag], referenceVideo[tag]);
+      assert.notEqual(video.color_space, 'reserved');
+      assert.ok(result.streams.some((s: any) => s.codec_type === 'audio' && s.codec_name === 'aac'));
+      assert.equal(await hash(source), digest);
+      await command(settings.ffmpeg, ['-v', 'error', '-xerror', '-i', outputs.film_h264, '-f', 'null', '-']);
+      // Also verify accelerated backends where the installed tools support them.
+      if (hardware.nvenc) {
+        const info = parseVideoInfo(before);
+        for (const mode of hardware.cudaScale && !hdr ? ['cuda', 'nvenc'] as const : ['nvenc'] as const) {
+          const destination = path.join(outputDirectory, `${mode}.mp4`);
+          await command(settings.ffmpeg, videoArgs(source, destination, info, settings, mode));
+          const accelerated = (await probe(destination)).streams.find((s: any) => s.codec_type === 'video');
+          assert.equal(accelerated.codec_name, 'h264');
+          assert.notEqual(accelerated.color_space, 'reserved');
+          if (hdr) assert.equal(accelerated.color_transfer, 'bt709');
+          await command(settings.ffmpeg, ['-v', 'error', '-xerror', '-i', destination, '-f', 'null', '-']);
+        }
+      }
+    });
+  }
 });
 test('image cache memory scales with hardware while preserving system headroom', () => {
   assert.equal(imageCacheEnvironment(128, 32).MAGICK_MEMORY_LIMIT, '992MiB');

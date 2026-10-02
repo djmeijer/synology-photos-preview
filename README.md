@@ -196,6 +196,12 @@ The runtime connects to the configured NAS. The default benchmark uses generated
 
 ## Troubleshooting
 
+### FFmpeg reports `Invalid color range` for a video
+
+FFmpeg 7.0 can report this error when the video's color-space matrix is tagged as `reserved`. The failure happens before video filters run, so a color correction filter alone cannot fix it. The app now corrects this invalid H.264/HEVC tag in memory before decoding, for both thumbnails and video previews. It uses the advertised color primaries to choose the matrix when possible, otherwise marks it unspecified. Valid color-space tags, full/limited range, HDR transfer tags, and original files are preserved.
+
+Restart the server after updating, reconnect, and use **Retry failed** if the failed run is still available, or **Execute now** in the affected space. After a restart, the NAS returns files whose previews are still missing.
+
 ### ImageMagick reports `cache resources exhausted`
 
 Large photos can exceed ImageMagick's memory cache and require much slower temporary disk caching. The app now gives each image worker a safe share of installed RAM, while reserving half of usable memory for the rest of the pipeline and capping each ImageMagick memory resource at 1 GiB. It also allows up to 1 GiB of disk cache per thumbnail conversion, including memory-mapped files, and includes that allowance in its staged-storage reservation. Older versions fixed every worker's memory and map caches at 256 MiB and capped disk caching at 64 MiB, which could make high-resolution photos very slow or fail even with free RAM and disk space.

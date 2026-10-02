@@ -7,7 +7,7 @@ import { Semaphore } from './queue.ts';
 import { imageCacheEnvironment } from './image-resources.ts';
 import type { Hardware, MediaItem, Settings } from '../shared/types.ts';
 
-export interface VideoInfo { streamIndex: number; width: number; height: number; duration: number; rotation: number; hdr: boolean; }
+export interface VideoInfo { streamIndex: number; width: number; height: number; duration: number; rotation: number; hdr: boolean; inputBitstreamFilter?: string; }
 export function parseVideoInfo(data: any): VideoInfo {
   const stream = data.streams?.find((s: any) => s.codec_type === 'video' && !s.disposition?.attached_pic);
   if (!stream || !stream.width || !stream.height) throw new AppError('No usable video stream found.', 409, 'TOOL_ERROR');
@@ -19,8 +19,19 @@ export function parseVideoInfo(data: any): VideoInfo {
   if (sar.length === 2 && sar[0] > 0 && sar[1] > 0) width = Math.round(width * sar[0] / sar[1]);
   if (!Number.isFinite(width) || !Number.isFinite(height) || width < 2 || height < 2 || !Number.isFinite(rotation)) throw new AppError('Invalid video dimensions or orientation.', 409, 'TOOL_ERROR');
   if (Math.abs(rotation) % 180 === 90) [width, height] = [height, width];
+  // FFmpeg 7 rejects the reserved matrix value (3) before any video filter can
+  // run, reporting it as "Invalid color range". Correct the compressed stream
+  // on input so thumbnails and every encoding backend see usable metadata.
+  // Use the advertised primaries where possible, otherwise mark it unspecified.
+  const matrix = ({ bt709: 1, bt470bg: 5, smpte170m: 6, smpte240m: 7, bt2020: 9 } as Record<string, number>)[stream.color_primaries] ?? 2;
+  const inputBitstreamFilter = stream.color_space === 'reserved' && ['h264', 'hevc'].includes(stream.codec_name)
+    ? `${stream.codec_name}_metadata=matrix_coefficients=${matrix}` : undefined;
   return { streamIndex, width, height, rotation, duration: Number(data.format?.duration ?? stream.duration) || 0,
-    hdr: ['smpte2084', 'arib-std-b67'].includes(stream.color_transfer) };
+    hdr: ['smpte2084', 'arib-std-b67'].includes(stream.color_transfer),
+    ...(inputBitstreamFilter ? { inputBitstreamFilter } : {}) };
+}
+export function videoInputArgs(source: string, info: VideoInfo): string[] {
+  return [...(info.inputBitstreamFilter ? [`-bsf:${info.streamIndex}`, info.inputBitstreamFilter] : []), '-i', source];
 }
 export function videoDimensions(info: VideoInfo, shortEdge = 720) {
   const factor = Math.min(1, shortEdge / Math.min(info.width, info.height));
@@ -39,7 +50,7 @@ export function videoArgs(source: string, destination: string, info: VideoInfo, 
   const filter = mode === 'cuda' ? `scale_cuda=${dimensions.width}:${dimensions.height}:format=yuv420p,setsar=1` : softwareFilters(info, dimensions.width, dimensions.height);
   return ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-threads', String(settings.softwareThreads),
     ...(mode === 'cuda' ? ['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'] : []),
-    '-i', source, '-map', `0:${info.streamIndex}`, '-map', '0:a:0?', '-vf', filter,
+    ...videoInputArgs(source, info), '-map', `0:${info.streamIndex}`, '-map', '0:a:0?', '-vf', filter,
     ...(mode === 'software' ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(settings.cq)]
       : ['-c:v', 'h264_nvenc', '-preset', 'p1', '-tune', 'hq', '-rc', 'vbr', '-cq', String(settings.cq), '-b:v', '0', '-multipass', 'disabled']),
     // Synology previews do not benefit from high-speed source frame rates. This
@@ -117,7 +128,7 @@ export class MediaConverter {
       const frame = path.join(directory, 'frame.jpg');
       const dims = videoDimensions(info, 1280);
       await this.cpu.use(signal, () => command(this.settings.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-threads', String(this.settings.softwareThreads),
-        '-filter_threads', String(this.settings.softwareThreads), '-i', source, '-map', `0:${info.streamIndex}`, '-vf', softwareFilters(info, dims.width, dims.height), '-frames:v', '1', '-update', '1', frame], { signal }));
+        '-filter_threads', String(this.settings.softwareThreads), ...videoInputArgs(source, info), '-map', `0:${info.streamIndex}`, '-vf', softwareFilters(info, dims.width, dims.height), '-frames:v', '1', '-update', '1', frame], { signal }));
       Object.assign(outputs, await this.thumbnails(frame, directory, signal));
     }
     if (item.needVideo) {
