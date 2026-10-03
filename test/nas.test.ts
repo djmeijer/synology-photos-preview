@@ -5,7 +5,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promise
 import os from 'node:os';
 import path from 'node:path';
 import { fetchConversionBatch, NasClient, normalizeItem, normalizeUrl, retry } from '../server/nas.ts';
-import { DownloadReservationError, NasError } from '../server/errors.ts';
+import { DownloadReservationError, errorMessage, NasDownloadError, NasError } from '../server/errors.ts';
 
 const raw = (id: number, type: number | string = 0) => ({ unit_id: id, filename: `media-${id}.heic`, type, need_thumbnail: true, need_video: type === 1 });
 test('fetches one batch without requiring totals, offsets or pagination', async () => {
@@ -251,5 +251,36 @@ test('transfer retries reset byte progress even when the next attempt is larger'
   await client.upload(item, { thumb_sm: source }, new AbortController().signal, (_percent, bytes = 0) => uploadBytes.push(bytes));
   assert.equal(uploadBytes.filter(bytes => bytes === 0).length, 2);
   assert.equal(requests.filter(request => request.method === 'upload').length, 2);
+  await client.logout();
+});
+
+test('persistently interrupted downloads retain byte counts after bounded retries', async t => {
+  const { client, requests } = await mockNas(t, { persistentPartialDownload: true });
+  await client.login('secret');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-incomplete-download-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'source.jpg');
+  await assert.rejects(client.download(normalizeItem(raw(1), 'personal'), source, new AbortController().signal, 1024, () => {}), (error: unknown) => {
+    assert.ok(error instanceof NasDownloadError);
+    assert.equal(error.receivedBytes, 5); assert.equal(error.expectedBytes, 14);
+    assert.match(errorMessage(error), /original-media download was incomplete \(received 5 of 14 bytes\)/);
+    assert.match(errorMessage(error), /Synology Photos/);
+    return true;
+  });
+  assert.equal(requests.filter(request => request.method === 'download').length, 4);
+  assert.equal(await readFile(source, 'utf8'), 'first');
+  await client.logout();
+});
+
+test('Stop cancels an interrupted download without retrying or relabeling cancellation', async t => {
+  const { client, requests } = await mockNas(t, { persistentPartialDownload: true });
+  await client.login('secret');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'desktop-cancel-download-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const controller = new AbortController();
+  await assert.rejects(client.download(normalizeItem(raw(1), 'personal'), path.join(directory, 'source.jpg'), controller.signal, 1024, (_percent, bytes) => {
+    if (bytes) controller.abort();
+  }), { name: 'AbortError' });
+  assert.equal(requests.filter(request => request.method === 'download').length, 1);
   await client.logout();
 });

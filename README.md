@@ -82,6 +82,8 @@ If the application or computer restarts, unfinished items can be returned by the
 
 Synology Photos exposes a conversion work queue, not a reliable backlog count or conventional paginated list. The application calls `list_convert_needed` for the Windows preview preset. Synology chooses which pending items to return and may return fewer items than the requested limit.
 
+An empty conversion queue does not establish that every media file on disk has all previews. A filesystem scan for specific `@eaDir` filenames checks their existence and size; this application checks the work requested by Synology Photos for the signed-in account and selected space. Files absent from the Photos index, unsupported media, damaged originals, or an index that no longer reflects the preview files can require separate investigation. These are possible causes, not conclusions drawn from an empty queue. Inspect affected files in Photos and their cache directories before choosing a repair. Synology documents Photos-specific re-indexing under **Settings > Personal (or Shared Space) > Indexing > Re-index** in its [display troubleshooting guide](https://kb.synology.com/en-us/DSM/tutorial/What_can_I_do_if_photos_doesnt_show_items). Re-indexing is an investigation/recovery step and is not guaranteed to make every file appear in the desktop conversion queue.
+
 An acknowledged preview upload normally causes Synology to remove that work from its pending set. An acknowledgment alone does not prove the requested previews are ready. Later queue requests can then expose more items. Consequently:
 
 - The displayed total grows as new work becomes visible.
@@ -205,6 +207,12 @@ increase **Staged storage limit**, reduce **Download workers**, or both. Also ma
 The runtime connects to the configured NAS. The default benchmark uses generated local fixtures. The optional real-media integration suite downloads the public libheif example HEIC image if it is not already cached under `.test-data/media`.
 
 ## Troubleshooting
+
+### An original-media download is incomplete
+
+The app retries interrupted original-media downloads up to three times. If the download still fails, the file's error reports the number of bytes received in the last attempt and the expected size when the NAS supplied it. Conversion and preview upload do not start for an incomplete download.
+
+Try downloading the affected original directly from Synology Photos. If it also fails there, check the source file on the NAS and any reverse proxy serving Photos. Repeated failure at the same byte count is useful evidence, but does not by itself establish whether the source file or the connection is at fault. After resolving the download issue, use **Retry failed**. Restart the desktop server and reconnect after updating to receive the improved diagnostics.
 
 ### FFmpeg reports `Invalid color range` for a video
 

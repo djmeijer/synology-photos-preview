@@ -6,7 +6,7 @@ import { rm } from 'node:fs/promises';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { AppError, DownloadReservationError, NasError } from './errors.ts';
+import { AppError, DownloadReservationError, NasDownloadError, NasError } from './errors.ts';
 import { mediaDateLookupBatchSize, type Connection, type ConversionBatch, type MediaItem, type SkippedMedia, type Space } from '../shared/types.ts';
 
 type ApiInfo = { path: string; minVersion: number; maxVersion: number };
@@ -31,7 +31,7 @@ export async function retry<T>(operation: () => Promise<T>, signal?: AbortSignal
       signal?.throwIfAborted();
       const e = error as { code?: string; response?: { status: number; headers?: Record<string, string> } };
       const status = e.response?.status;
-      if (attempt >= 3 || (!(status && ([408, 425, 429].includes(status) || status >= 500)) && !transientCodes.has(e.code ?? '') && !canRetry(error))) throw error;
+      if (attempt >= 3 || (!(status && ([408, 425, 429].includes(status) || status >= 500)) && !transientCodes.has(e.code ?? '') && !(error instanceof NasDownloadError) && !canRetry(error))) throw error;
       const header = e.response?.headers?.['retry-after'];
       const requested = header ? (Number.isFinite(Number(header)) ? Number(header) * 1000 : Date.parse(header) - Date.now()) : 0;
       await wait(Math.max(Math.min(30_000, 1000 * 2 ** attempt) * (0.5 + Math.random() * 0.5), Math.min(120_000, requested || 0)));
@@ -193,8 +193,16 @@ export class NasClient {
         progress(length > 0 ? Math.min(100, bytes / length * 100) : null, bytes);
         done(null, chunk);
       } });
-      await pipeline(response.data, counter, createWriteStream(destination), { signal });
-      if (!bytes || (length > 0 && bytes !== length)) throw Object.assign(new Error('Truncated media download'), { code: 'ECONNRESET' });
+      try {
+        await pipeline(response.data, counter, createWriteStream(destination), { signal });
+      } catch (error) {
+        signal.throwIfAborted();
+        if (['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_BAD_RESPONSE'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+          throw new NasDownloadError(bytes, length);
+        }
+        throw error;
+      }
+      if (!bytes || (length > 0 && bytes !== length)) throw new NasDownloadError(bytes, length);
     }, signal);
   }
   async upload(item: MediaItem, outputs: Record<string, string>, signal: AbortSignal, progress: (percent: number | null, bytes?: number) => void) {

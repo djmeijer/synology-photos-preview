@@ -154,7 +154,7 @@ export class Studio extends EventEmitter {
         this.settings = settings;
         ({ items, skipped } = await this.fetchBatch(library));
       }
-      if (!items.length) throw new AppError(skipped.length ? `No supported pending previews to process. ${skipped.length} file(s) or component(s) are skipped and remain pending on the NAS.` : 'The NAS returned no pending previews for the selected space.', 409);
+      if (!items.length) throw new AppError(skipped.length ? `No supported pending previews to process. ${skipped.length} file(s) or component(s) are skipped and remain pending on the NAS.` : 'The NAS returned no pending previews for the selected space. This checks the Synology Photos conversion queue; it does not verify preview files on disk.', 409);
       const batch = await this.launchBatch(library, items, skipped);
       this.batchLoop = this.continueBatches(batch.job, batch.directory);
     } finally { this.starting = false; this.changed(); }

@@ -2,7 +2,7 @@ import type test from 'node:test';
 import http from 'node:http';
 import { NasClient } from '../server/nas.ts';
 const raw = (id: number) => ({ unit_id: id, filename: 'media-' + id + '.heic', type: 0, need_thumbnail: true, time: 1_609_459_200 + id * 86_400 });
-export async function mockNas(t: test.TestContext, options: { otp?: boolean; denyShared?: boolean; rejectUpload?: boolean; transientDownload?: boolean; advertisedShared?: boolean; authMax?: number; listOnlyQueue?: boolean; queueBatches?: number[][]; deviceToken?: unknown; partialDownload?: boolean; transientUpload?: boolean; queueList?: unknown[]; chunkedDownload?: boolean; uploadCodes?: number[] } = {}) {
+export async function mockNas(t: test.TestContext, options: { otp?: boolean; denyShared?: boolean; rejectUpload?: boolean; transientDownload?: boolean; advertisedShared?: boolean; authMax?: number; listOnlyQueue?: boolean; queueBatches?: number[][]; deviceToken?: unknown; partialDownload?: boolean; persistentPartialDownload?: boolean; transientUpload?: boolean; queueList?: unknown[]; chunkedDownload?: boolean; uploadCodes?: number[] } = {}) {
   const requests: { api: string; method: string; params: URLSearchParams; cookie: string; body: string }[] = [];
   let downloads = 0, uploads = 0, queueRequest = 0;
   const catalog = Object.fromEntries(['SYNO.API.Auth', 'SYNO.Foto.Upload.ConvertedFile', 'SYNO.Foto.Download', ...(options.advertisedShared === false ? [] : ['SYNO.FotoTeam.Upload.ConvertedFile', 'SYNO.FotoTeam.Download'])].map(api => [api, { path: 'entry.cgi', minVersion: 1, maxVersion: api === 'SYNO.API.Auth' ? options.authMax ?? 7 : api.endsWith('ConvertedFile') ? 3 : 1 }]));
@@ -31,7 +31,7 @@ export async function mockNas(t: test.TestContext, options: { otp?: boolean; den
     if (method === 'download') {
       downloads++;
       if (options.transientDownload && downloads === 1) { res.writeHead(503); return res.end('retry'); }
-      if (options.partialDownload && downloads === 1) {
+      if (options.persistentPartialDownload || (options.partialDownload && downloads === 1)) {
         res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': '14' }); res.write('first');
         setTimeout(() => res.destroy(), 30); return;
       }
