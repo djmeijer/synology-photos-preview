@@ -4,6 +4,8 @@ Synology Preview Studio uses a Windows desktop to generate missing thumbnails an
 
 The application is useful when preview generation on the NAS is slow, incomplete, or unable to handle formats such as HEIC, HEVC, and HDR video efficiently.
 
+![Synology Preview Studio generating previews, showing live progress, transfer rates, and active files](docs/images/preview-generation.png)
+
 > [!IMPORTANT]
 > This project uses Synology Photos web APIs that Synology does not publicly document as a stable integration surface. DSM or Synology Photos updates may change their behavior.
 
